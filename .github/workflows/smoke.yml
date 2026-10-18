@@ -1,0 +1,35 @@
+name: smoke
+
+# Runs tests/smoke_image.sh inside a pushed image, by digest, before it goes to
+# a phone: the boot step against this Hermes' real `cron create`, the scripts
+# on the image's own Python. tools/build_image.py prints the reference to pass.
+#
+#   gh workflow run smoke -f image=ghcr.io/alvesoff/ritmo-hermes-agent@sha256:...
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "Image reference by digest (ghcr.io/...@sha256:...)"
+        required: true
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Smoke test inside the image
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: |
+          case "$IMAGE" in *@sha256:*) ;; *) echo "pass the image by digest" >&2; exit 1 ;; esac
+          docker run --rm --platform linux/amd64 --entrypoint /bin/sh -v "$PWD/tests:/tests:ro" "$IMAGE" /tests/smoke_image.sh
+          echo "Smoke OK: \`$IMAGE\`" >> "$GITHUB_STEP_SUMMARY"

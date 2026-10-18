@@ -1,0 +1,22 @@
+name: ci
+
+# Unit tests on every pull request and push to main. The image itself is built
+# without Docker by tools/build_image.py and checked by the `smoke` workflow,
+# which runs tests/smoke_image.sh inside the exact image that was pushed.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m unittest discover -s tests -v

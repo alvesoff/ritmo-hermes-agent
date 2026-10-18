@@ -1,0 +1,29 @@
+#!/bin/sh
+# Let an updated persona reach conversations that already exist.
+#
+# Hermes stores each session's system prompt and keeps the first one it saw,
+# so without this an owner talks to the persona of the day they first wrote,
+# whatever image they run now. Clearing the stored prompt makes the next turn
+# record the current one; when nothing changed the prompt is identical and
+# nothing happens. Message history is never touched.
+#
+# As the agent: a root-written state.db would lock the agent out of its home.
+set -eu
+
+[ -f /var/lib/hermes/state.db ] || exit 0
+
+/command/s6-setuidgid hermes /opt/hermes/.venv/bin/python3 - <<'PY' || \
+  echo "[ritmo] could not refresh stored prompts; the agent starts anyway"
+import sqlite3
+
+try:
+    connection = sqlite3.connect("/var/lib/hermes/state.db", timeout=10)
+    cursor = connection.execute(
+        "UPDATE sessions SET system_prompt_hash = NULL, system_prompt = NULL "
+        "WHERE system_prompt_hash IS NOT NULL"
+    )
+    connection.commit()
+    print(f"[ritmo] {cursor.rowcount} session(s) will re-read the persona")
+except sqlite3.Error as error:
+    print(f"[ritmo] stored prompts kept: {error}")
+PY

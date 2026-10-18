@@ -1,0 +1,34 @@
+#!/bin/sh
+# Put this image's skills back over the agent's home copy, every boot.
+#
+# Hermes syncs bundled skills into the home but skips any it thinks the owner
+# customised, by comparing a hash per directory. The home is writable by the
+# agent, so one turn that touches a file there would freeze that skill for
+# good: no fix from this image would reach it again, silently. Here the image
+# is the source of truth, and the manifest line is dropped so the next sync
+# records the right hash.
+set -eu
+
+BUNDLED=/opt/hermes/skills
+HOME_SKILLS=/var/lib/hermes/skills
+MANIFEST="$HOME_SKILLS/.bundled_manifest"
+
+[ -d "$HOME_SKILLS" ] || exit 0
+
+for name in $(cat /opt/ritmo/skills.list 2>/dev/null); do
+  source="$BUNDLED/$name"
+  target="$HOME_SKILLS/$name"
+  [ -d "$source" ] || continue
+  if [ -d "$target" ] && diff -rq "$source" "$target" >/dev/null 2>&1; then
+    continue
+  fi
+  echo "[ritmo] restoring skill $name from the image"
+  rm -rf "$target"
+  cp -a "$source" "$target"
+  chown -R hermes:hermes "$target"
+  if [ -f "$MANIFEST" ]; then
+    grep -v "^$name:" "$MANIFEST" > "$MANIFEST.new" 2>/dev/null || true
+    mv "$MANIFEST.new" "$MANIFEST"
+    chown hermes:hermes "$MANIFEST"
+  fi
+done

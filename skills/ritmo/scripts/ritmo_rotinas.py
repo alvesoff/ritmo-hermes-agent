@@ -52,7 +52,8 @@ def context(config: dict, agenda: dict, routine: str, now: dt.datetime) -> dict:
         payload["tomorrow"] = core.items_between(agenda, config, tomorrow, tomorrow)
         payload["fixed_tomorrow"] = core.fixed_on(config, tomorrow)
     else:
-        last_week = today - dt.timedelta(days=7)
+        # Seven days ending today, so back-to-back weekly reviews never count a day twice.
+        last_week = today - dt.timedelta(days=6)
         payload["last_7_days"] = core.items_between(agenda, config, last_week, today)
         payload["next_7_days"] = core.items_between(agenda, config, tomorrow, today + dt.timedelta(days=7))
         payload["fixed_by_day"] = {

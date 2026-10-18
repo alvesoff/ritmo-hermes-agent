@@ -6,8 +6,8 @@ loop; printing nothing is a silent tick. So a reminder costs no tokens and
 arrives on the minute it was set for.
 
 It never fails loudly. A non-zero exit would put a technical error alert in
-the owner's chat every minute, which is worse than a missed reminder; errors
-go to ritmo/errors.log instead, where `ritmo.py doctor` shows them.
+the owner's chat, which is worse than a missed reminder; errors go to
+ritmo/errors.log instead, where `ritmo.py doctor` shows them.
 """
 
 from __future__ import annotations
@@ -22,8 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ritmo_core as core  # noqa: E402
 
 
-def compose(config: dict, items: list[dict], habits: list, fixed: list, missed: list[dict]) -> str:
-    words = core.texts(config)
+def compose(words: dict, config: dict, items: list[dict], habits: list, fixed: list, missed: list[dict]) -> str:
     tz = core.zone(config)
     lines = []
     for item, start in fixed:
@@ -43,7 +42,7 @@ def compose(config: dict, items: list[dict], habits: list, fixed: list, missed: 
         lines.append(words["missed"].format(items=names))
     if items:
         lines.append(words["footer"])
-    return "\n".join(lines)
+    return "\n".join(line for line in lines if line.strip())
 
 
 def tick() -> str:
@@ -59,6 +58,15 @@ def tick() -> str:
         fixed = core.due_fixed(config, state, now)
         if not (items or missed or habits or fixed):
             return ""
+        # The message is built before anything is marked sent: a template that
+        # cannot be filled must never cost the owner a reminder. Validation
+        # refuses such templates; the default wording is the last resort.
+        try:
+            message = compose(core.texts(config), config, items, habits, fixed, missed)
+        except (KeyError, IndexError, ValueError):
+            core.log_error("ritmo_lembretes", "owner template failed, used the default wording\n"
+                           + traceback.format_exc())
+            message = compose(core.texts(config, defaults_only=True), config, items, habits, fixed, missed)
         stamp = now.isoformat(timespec="seconds")
         for item in items:
             item["reminded_at"] = stamp
@@ -72,7 +80,7 @@ def tick() -> str:
         # instead of sending it twice.
         core.write_json("state.json", state)
         core.write_json("agenda.json", agenda)
-    return compose(config, items, habits, fixed, missed)
+    return message
 
 
 def main() -> int:

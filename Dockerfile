@@ -3,7 +3,14 @@
 #
 # The base is pinned by immutable tag AND digest: an agent holding a live Plow
 # credential must not have code swapped underneath it by a moved tag.
-FROM public.ecr.aws/e1h7x4a2/plow-cloud-agents:base-7422f99a12b15489408cacfbf884d745d4eccab5@sha256:efe3b0fdf97601c8a1b14b3faf31d0c919116c40687c5252cf501e5f6ff19898
+#
+# BASE_REGISTRY only says where to fetch those exact bytes from. CI points it
+# at a GHCR mirror because ECR Public throttles GitHub's shared runner IPs
+# ("429 Data limit exceeded"); the digest makes the mirror byte-identical.
+ARG BASE_REGISTRY=public.ecr.aws/e1h7x4a2/plow-cloud-agents
+ARG BASE_TAG=base-7422f99a12b15489408cacfbf884d745d4eccab5
+ARG BASE_DIGEST=sha256:efe3b0fdf97601c8a1b14b3faf31d0c919116c40687c5252cf501e5f6ff19898
+FROM ${BASE_REGISTRY}:${BASE_TAG}@${BASE_DIGEST}
 
 # Who this agent is on the Agent Index. Baked in because a cloud deploy passes
 # no environment; a fork with its own listing overrides it.

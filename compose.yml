@@ -1,0 +1,21 @@
+# Run Ritmo on your own machine instead of Plow's cloud.
+#
+#   plow-agents login && plow-agents lines
+#   plow-agents deploy --local --line ln_xxx
+#
+# `deploy --local` mints ./plow-credentials and starts this file. On Plow's
+# cloud none of it is used: the platform sets the environment itself.
+services:
+  agent:
+    build: .
+    # PLOW_API_BASE and PLOW_AGENT_TOKEN, as `plow-agents mint` writes them.
+    env_file: ${PLOW_CREDENTIALS:-./plow-credentials}
+    volumes:
+      # The agent's home: settings, agenda, sessions. `down -v` starts over.
+      - agent-home:/var/lib/hermes
+    restart: unless-stopped
+    # The agent saves its session on SIGTERM within 30s.
+    stop_grace_period: 35s
+
+volumes:
+  agent-home:

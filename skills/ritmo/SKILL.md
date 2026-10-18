@@ -72,6 +72,19 @@ Then `config set '{"onboarded": true}'` and send one message: what tomorrow
 looks like and when they will hear from you. Skipping a question is fine;
 the defaults stand and they can change anything later.
 
+## Backup and restore
+
+A new version of Ritmo on Plow starts as a new agent with an empty memory, so
+the routine travels through the owner's chat:
+
+- **Backup** ("backup", "vou atualizar", "me manda o backup"): run `export`
+  and send two messages: one line in their language saying to forward the next
+  message after the update, then the `code` alone, exactly as printed.
+- **Restore**: any message containing `RITMO-BACKUP-1:` is the owner bringing
+  their setup back. Run `import '<the whole message>'` before anything else,
+  then confirm in one or two lines what came back (habits, commitments,
+  reminders) and skip onboarding. Never repeat the code.
+
 ## Answering a reminder
 
 Reminders arrive as messages like `⏰ 14:00 · Study English (50 min)` and are

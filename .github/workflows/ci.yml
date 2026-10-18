@@ -1,0 +1,75 @@
+name: ci
+
+# Pull requests: unit tests, then the image is built and smoke-tested inside.
+# main and manual runs also push it to GHCR and print the digest reference that
+# `plow-agents deploy` and `image promote` take.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m unittest discover -s tests -v
+
+  image:
+    needs: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build (linux/amd64, the platform Plow runs)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: ritmo:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test inside the image
+        run: docker run --rm --entrypoint /bin/sh -v "$PWD/tests:/tests:ro" ritmo:ci /tests/smoke_image.sh
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        if: github.event_name != 'pull_request'
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          # A plain image manifest: no attestation index for Plow's pull to trip on.
+          provenance: false
+          sbom: false
+          tags: |
+            ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
+            ghcr.io/${{ github.repository }}:latest
+          cache-from: type=gha
+
+      - name: Digest reference
+        if: github.event_name != 'pull_request'
+        run: |
+          ref="ghcr.io/${{ github.repository }}@${{ steps.push.outputs.digest }}"
+          echo "$ref"
+          echo "Deploy reference: \`$ref\`" >> "$GITHUB_STEP_SUMMARY"

@@ -1,22 +1,15 @@
 name: ci
 
-# Pull requests: unit tests, then the image is built and smoke-tested inside.
-# main and manual runs also push it to GHCR and print the digest reference that
-# `plow-agents deploy` and `image promote` take.
+# Unit tests on every pull request and push to main. The image itself is built
+# without Docker by tools/build_image.py and checked by the `smoke` workflow,
+# which runs tests/smoke_image.sh inside the exact image that was pushed.
 on:
   pull_request:
   push:
     branches: [main]
-  workflow_dispatch:
 
 permissions:
   contents: read
-  packages: write
-
-env:
-  CRANE_VERSION: v0.20.2
-  BASE_SOURCE: public.ecr.aws/e1h7x4a2/plow-cloud-agents
-  BASE_MIRROR: ghcr.io/${{ github.repository_owner }}/plow-cloud-agents
 
 jobs:
   tests:
@@ -27,82 +20,3 @@ jobs:
         with:
           python-version: "3.11"
       - run: python -m unittest discover -s tests -v
-
-  image:
-    needs: tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      # ECR Public throttles GitHub's shared runner IPs. The pinned base is
-      # copied once into GHCR with crane, which keeps the digest, and every
-      # build after that reads the mirror. A throttled first copy retries.
-      - name: Base image, mirrored once into GHCR
-        id: base
-        run: |
-          tag=$(sed -n 's/^ARG BASE_TAG=//p' Dockerfile)
-          digest=$(sed -n 's/^ARG BASE_DIGEST=//p' Dockerfile)
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          mkdir -p "$RUNNER_TEMP/bin" && export PATH="$RUNNER_TEMP/bin:$PATH"
-          curl -fsSL "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" \
-            | tar -xz -C "$RUNNER_TEMP/bin" crane
-          if crane digest "${BASE_MIRROR}@${digest}" >/dev/null 2>&1; then
-            echo "mirror already holds ${digest}"
-            exit 0
-          fi
-          for attempt in 1 2 3 4 5; do
-            if crane copy "${BASE_SOURCE}@${digest}" "${BASE_MIRROR}:${tag}"; then
-              [ "$(crane digest "${BASE_MIRROR}:${tag}")" = "$digest" ] || { echo "mirror digest differs" >&2; exit 1; }
-              exit 0
-            fi
-            sleep $((attempt * 30))
-          done
-          exit 1
-
-      - name: Build (linux/amd64, the platform Plow runs)
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64
-          load: true
-          tags: ritmo:ci
-          build-args: |
-            BASE_REGISTRY=${{ env.BASE_MIRROR }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Smoke test inside the image
-        run: docker run --rm --entrypoint /bin/sh -v "$PWD/tests:/tests:ro" ritmo:ci /tests/smoke_image.sh
-
-      - name: Push
-        if: github.event_name != 'pull_request'
-        id: push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64
-          push: true
-          build-args: |
-            BASE_REGISTRY=${{ env.BASE_MIRROR }}
-          # A plain image manifest: no attestation index for Plow's pull to trip on.
-          provenance: false
-          sbom: false
-          tags: |
-            ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
-            ghcr.io/${{ github.repository }}:latest
-          cache-from: type=gha
-
-      - name: Digest reference
-        if: github.event_name != 'pull_request'
-        run: |
-          ref="ghcr.io/${{ github.repository }}@${{ steps.push.outputs.digest }}"
-          echo "$ref"
-          echo "Deploy reference: \`$ref\`" >> "$GITHUB_STEP_SUMMARY"

@@ -45,6 +45,21 @@ def compose(words: dict, config: dict, items: list[dict], habits: list, fixed: l
     return "\n".join(line for line in lines if line.strip())
 
 
+def deliver_outbox() -> str:
+    """A message the agent queued to go out verbatim (the backup code), alone in its bubble.
+
+    Reminders take the minute when both are due; the outbox goes the next one.
+    The caller holds the lock.
+    """
+    try:
+        with open(core.path("outbox.txt"), encoding="utf-8") as handle:
+            message = handle.read().strip()
+    except FileNotFoundError:
+        return ""
+    os.unlink(core.path("outbox.txt"))
+    return message
+
+
 def tick() -> str:
     config = core.load_config()
     if not core.configured(config):
@@ -57,7 +72,7 @@ def tick() -> str:
         habits = core.due_habits(config, state, now)
         fixed = core.due_fixed(config, state, now)
         if not (items or missed or habits or fixed):
-            return ""
+            return deliver_outbox()
         # The message is built before anything is marked sent: a template that
         # cannot be filled must never cost the owner a reminder. Validation
         # refuses such templates; the default wording is the last resort.

@@ -116,9 +116,13 @@ def cmd_now(args):
 def cmd_config(args):
     if args.action == "show":
         try:
-            out(core.load_config())
+            config = core.load_config()
         except RitmoError as error:
-            out({"invalid": str(error), "saved": core.read_json("config.json", {})})
+            # A set-up owner with one bad field is repaired, never re-onboarded.
+            out({"setup": {"needed": False, "repair": True}, "invalid": str(error),
+                 "saved": core.read_json("config.json", {})})
+            return
+        out({"setup": core.setup_status(config), "config": config})
         return
     with core.locked():
         # The raw file, not the validated one: these two commands are also
@@ -138,20 +142,18 @@ def cmd_config(args):
             config = core.save_config(core.deep_merge(saved, update))
             result = {"saved": update}
         else:
-            if args.value not in core.DEFAULT_CONFIG or args.value == "version":
+            if args.value in core.DEFAULT_CONFIG and args.value != "version":
+                saved[args.value] = json.loads(json.dumps(core.DEFAULT_CONFIG[args.value]))
+            elif args.value in saved and args.value not in core.DEFAULT_CONFIG:
+                del saved[args.value]  # a key this version does not know, e.g. from a newer backup
+            else:
                 raise RitmoError(f"unknown config key {args.value!r}")
-            saved[args.value] = json.loads(json.dumps(core.DEFAULT_CONFIG[args.value]))
             config = core.save_config(saved)
             result = {"reset": args.value}
-        if old_zone and config["timezone"] and old_zone != config["timezone"]:
-            try:
-                previous = core.ZoneInfo(old_zone)
-            except (core.ZoneInfoNotFoundError, ValueError):
-                previous = None
-            if previous is not None:
-                agenda = core.load_agenda()
-                result["reanchored_items"] = core.reanchor(agenda, previous, core.zone(config))
-                core.write_json("agenda.json", agenda)
+        moved = core.change_timezone(old_zone, config["timezone"])
+        if moved:
+            result["reanchored_items"] = moved
+    result["setup"] = core.setup_status(config)
     result["config"] = config
     out(result)
 
@@ -212,16 +214,8 @@ def cmd_add(args):
     config = ready()
     at = resolve_at(args, config)
     not_past(at, config)
-    text = args.text.strip()
-    if not text:
-        raise RitmoError("the reminder needs a text")
-    item = {"id": core.new_id(), "text": text, "at": at.isoformat(timespec="minutes"),
-            "status": "pending", "source": "plan" if args.plan else "owner",
-            "created": core.now_in(config).isoformat(timespec="seconds")}
-    if args.minutes:
-        item["minutes"] = args.minutes
-    if args.urgent:
-        item["urgent"] = True
+    item = core.new_item(args.text, at, "plan" if args.plan else "owner", core.now_in(config),
+                         minutes=args.minutes, urgent=args.urgent)
     with core.locked():
         agenda = core.load_agenda()
         agenda["items"].append(item)
@@ -316,20 +310,12 @@ def cmd_plan(args):
     tz = core.zone(config)
     fresh = []
     for entry in entries:
-        if not isinstance(entry, dict) or not str(entry.get("text", "")).strip():
-            raise RitmoError("each plan entry needs a text")
+        if not isinstance(entry, dict):
+            raise RitmoError("each plan entry is an object with text, time and optional minutes")
         at = core.at_local(day, core.check_time(entry.get("time"), "plan time"), tz)
         not_past(at, config)
-        item = {"id": core.new_id(), "text": str(entry["text"]).strip(), "at": at.isoformat(timespec="minutes"),
-                "status": "pending", "source": "plan", "created": now.isoformat(timespec="seconds")}
-        minutes = entry.get("minutes")
-        if minutes:
-            if not isinstance(minutes, int) or isinstance(minutes, bool) or minutes < 1:
-                raise RitmoError(f"plan minutes must be a whole number, got {minutes!r}")
-            item["minutes"] = minutes
-        if entry.get("urgent") is True:
-            item["urgent"] = True
-        fresh.append(item)
+        fresh.append(core.new_item(entry.get("text"), at, "plan", now,
+                                   minutes=entry.get("minutes"), urgent=entry.get("urgent") is True))
     with core.locked():
         agenda = core.load_agenda()
         kept = [item for item in agenda["items"]
@@ -347,35 +333,49 @@ def cmd_plan(args):
 
 
 BACKUP_PREFIX = "RITMO-BACKUP-1:"
+# The code ends with a dot, so words the owner adds after it are never read as
+# part of it (a trailing "ok" would otherwise turn a valid backup into garbage).
+BACKUP_PATTERN = re.compile(re.escape(BACKUP_PREFIX) + r"([A-Za-z0-9_\-\s]+)\.")
 
 
-def cmd_export(args):
-    """The owner's setup and open future items, as one message they can forward back.
-
-    A new image on Plow is a new agent with an empty home, so this is how a
-    routine survives an update: the code travels through the owner's own chat.
-    """
-    config = core.load_config()
-    now = core.now_in(config) if core.configured(config) else None
-    agenda = core.load_agenda()
+def backup_code(config: dict, agenda: dict) -> tuple[str, int]:
+    """Every open item not yet reminded (a held or just-due one included), plus the settings."""
     items = [
         {key: item[key] for key in ("text", "at", "minutes", "urgent", "source") if key in item}
         for item in agenda["items"]
-        if item.get("status") == "pending" and now is not None
-        and core.utc(dt.datetime.fromisoformat(item["at"])) > core.utc(now)
+        if item.get("status") == "pending" and not item.get("reminded_at")
     ]
-    payload = {"config": config, "items": items}
+    payload = {"exported": core.now_in(config).isoformat(timespec="minutes") if core.configured(config) else "",
+               "config": config, "items": items}
     packed = zlib.compress(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(), 9)
-    out({"code": BACKUP_PREFIX + base64.urlsafe_b64encode(packed).decode().rstrip("="),
-         "habits": len(config["habits"]), "fixed": len(config["fixed"]), "items": len(items)})
+    return BACKUP_PREFIX + base64.urlsafe_b64encode(packed).decode().rstrip("=") + ".", len(items)
 
 
-def cmd_import(args):
-    """Restore an exported setup: the settings replace these, future items are added."""
-    # The forwarded message may carry words around the code, or line breaks inside it.
-    match = re.search(re.escape(BACKUP_PREFIX) + r"([A-Za-z0-9_\-\s]+)", args.code)
+def cmd_export(args):
+    """The owner's setup and open items, as one message they forward back after an update.
+
+    A new image on Plow is a new agent with an empty home, so this is how a
+    routine survives an update. With --send the code is not printed for the
+    model to copy: the reminder clock delivers it verbatim within a minute,
+    because one wrong character in 600 would lose the whole routine.
+    """
+    config = core.load_config()
+    code, count = backup_code(config, core.load_agenda())
+    summary = {"habits": len(config["habits"]), "fixed": len(config["fixed"]), "items": count}
+    if args.send:
+        with core.locked():
+            with open(core.path("outbox.txt"), "w", encoding="utf-8") as handle:
+                handle.write(code + "\n")
+        out({"queued": "the backup message reaches the owner within a minute, on its own", **summary})
+        return
+    out({"code": code, **summary})
+
+
+def decode_backup(text: str) -> dict:
+    match = BACKUP_PATTERN.search(text)
     if not match:
-        raise RitmoError(f"a backup starts with {BACKUP_PREFIX}; ask the owner to forward the whole message")
+        raise RitmoError(f"a backup starts with {BACKUP_PREFIX} and ends with a dot; ask the owner to forward "
+                         "the whole backup message")
     body = "".join(match.group(1).split())
     try:
         payload = json.loads(zlib.decompress(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))))
@@ -384,35 +384,59 @@ def cmd_import(args):
     if not isinstance(payload, dict) or not isinstance(payload.get("config"), dict) \
             or not isinstance(payload.get("items"), list):
         raise RitmoError("that is not a Ritmo backup")
+    return payload
+
+
+def cmd_import(args):
+    """Restore an exported setup. Everything is checked first; nothing is written on a refusal."""
+    payload = decode_backup(args.code)
+    # Keys a newer Ritmo knows and this one does not are left behind.
+    settings = {key: value for key, value in payload["config"].items() if key in core.DEFAULT_CONFIG}
+    config = core.validate_config(settings)
+    if not core.configured(config):
+        raise RitmoError("the backup has no timezone; set the owner up instead")
+    now = core.now_in(config)
+    restored, expired, seen = [], [], set()
+    for entry in payload["items"]:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            at = dt.datetime.fromisoformat(str(entry.get("at")))
+        except ValueError:
+            continue
+        if at.tzinfo is None:
+            continue
+        try:
+            item = core.new_item(entry.get("text"), at.astimezone(core.zone(config)), entry.get("source", "owner"),
+                                 now, minutes=entry.get("minutes"), urgent=entry.get("urgent") is True)
+        except RitmoError:
+            continue
+        key = (item["text"], core.utc(at))
+        if key in seen:
+            continue
+        seen.add(key)
+        if core.utc(at) <= core.utc(now) - PAST_TOLERANCE:
+            expired.append({"text": item["text"], "time": at.astimezone(core.zone(config)).strftime("%Y-%m-%d %H:%M")})
+            continue
+        restored.append(item)
     with core.locked():
-        config = core.save_config(payload["config"])
-        now = core.now_in(config) if core.configured(config) else None
+        previous = core.read_json("config.json", {})
         agenda = core.load_agenda()
-        known = {(item["text"], item["at"]) for item in agenda["items"]}
-        added = 0
-        for entry in payload["items"]:
-            if not isinstance(entry, dict) or not str(entry.get("text", "")).strip():
-                continue
-            try:
-                at = dt.datetime.fromisoformat(str(entry["at"]))
-            except (KeyError, ValueError):
-                continue
-            if at.tzinfo is None or now is None or core.utc(at) <= core.utc(now):
-                continue
-            if (entry["text"], entry["at"]) in known:
-                continue
-            item = {"id": core.new_id(), "text": str(entry["text"]).strip(), "at": at.isoformat(timespec="minutes"),
-                    "status": "pending", "source": "plan" if entry.get("source") == "plan" else "owner",
-                    "created": now.isoformat(timespec="seconds")}
-            if isinstance(entry.get("minutes"), int) and not isinstance(entry.get("minutes"), bool):
-                item["minutes"] = entry["minutes"]
-            if entry.get("urgent") is True:
-                item["urgent"] = True
-            agenda["items"].append(item)
-            added += 1
+        existing = {(item["text"], core.utc(dt.datetime.fromisoformat(item["at"]))) for item in agenda["items"]}
+        added = [item for item in restored
+                 if (item["text"], core.utc(dt.datetime.fromisoformat(item["at"]))) not in existing]
+        agenda["items"].extend(added)
         core.write_json("agenda.json", agenda)
-    out({"restored": {"name": config["name"], "timezone": config["timezone"], "habits": len(config["habits"]),
-                      "fixed": len(config["fixed"]), "goals": len(config["goals"]), "items_added": added}})
+        old_zone = previous.get("timezone") if isinstance(previous.get("timezone"), str) else ""
+        config = core.save_config(settings)
+        # Items the new agent already had follow the restored zone, like any zone change.
+        core.change_timezone(old_zone, config["timezone"])
+    out({"restored": {"name": config["name"], "timezone": config["timezone"], "tone": config["tone"],
+                      "habits": len(config["habits"]), "fixed": len(config["fixed"]), "goals": len(config["goals"]),
+                      "items_added": len(added)},
+         "replaced_settings": bool(previous),
+         "expired_during_update": expired,
+         "backup_made": payload.get("exported", "")})
 
 
 def cmd_doctor(args):
@@ -500,7 +524,8 @@ def parser() -> argparse.ArgumentParser:
     plan.add_argument("date")
     plan.add_argument("items")
 
-    sub.add_parser("export")
+    export = sub.add_parser("export")
+    export.add_argument("--send", action="store_true", help="deliver the code to the owner verbatim, no copying")
     restore = sub.add_parser("import")
     restore.add_argument("code")
     return root

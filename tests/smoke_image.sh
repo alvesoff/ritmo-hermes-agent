@@ -25,9 +25,14 @@ for f in /etc/s6-overlay/scripts/ritmo-boot.sh /etc/cont-init.d/40-ritmo-skills;
 done
 echo "python: $($PY --version)"
 
+echo "== the python3 the agent's terminal resolves, with a timezone database"
+$AS_AGENT sh -c 'command -v python3 && python3 -c "import zoneinfo; zoneinfo.ZoneInfo(\"America/Sao_Paulo\"); print(\"zoneinfo OK\")"' \
+  || fail "python3 on PATH cannot resolve IANA zones"
+echo "upstream skill files still executable: $(find /opt/hermes/skills -path /opt/hermes/skills/ritmo -prune -o -type f -perm -u+x -print | wc -l)"
+
 echo "== an empty agent home"
 rm -rf /tmp/rh && mkdir -p /tmp/rh && cp /opt/hermes/plow-seed/config.yaml /tmp/rh/config.yaml
-chown -R hermes:hermes /tmp/rh
+chown -R hermes:hermes /tmp/rh && chmod 0640 /tmp/rh/config.yaml
 
 echo "== hermes cron create --help (for the log)"
 $AS_AGENT /opt/hermes/bin/hermes cron create --help | head -40 || true
@@ -57,6 +62,7 @@ PY
 for f in ritmo_core.py ritmo_lembretes.py ritmo_rotinas.py; do
   [ -f "/tmp/rh/scripts/$f" ] || fail "boot step did not publish $f"
 done
+[ "$(stat -c %a /tmp/rh/config.yaml)" = "640" ] || fail "boot step changed config.yaml's mode to $(stat -c %a /tmp/rh/config.yaml)"
 
 echo "== boot step again: idempotent"
 before=$(cat /tmp/rh/cron/jobs.json | md5sum)
@@ -65,8 +71,9 @@ after=$(cat /tmp/rh/cron/jobs.json | md5sum)
 [ "$before" = "$after" ] || fail "a second boot changed jobs.json"
 
 echo "== the scripts on the image's Python"
-R="$AS_AGENT $PY /opt/hermes/skills/ritmo/scripts/ritmo.py"
-$R config set '{"timezone": "America/Sao_Paulo", "language": "pt-BR", "onboarded": true}' >/dev/null
+$AS_AGENT python3 /opt/hermes/skills/ritmo/scripts/ritmo.py config set \
+  '{"timezone": "America/Sao_Paulo", "language": "pt-BR", "onboarded": true}' >/dev/null \
+  || fail "ritmo.py config set failed on the agent's python3"
 $AS_AGENT RITMO_NOW=2026-10-19T09:00:00-03:00 $PY /opt/hermes/skills/ritmo/scripts/ritmo.py add "Teste" --at 09:05 >/dev/null
 out=$($AS_AGENT RITMO_NOW=2026-10-19T09:05:00-03:00 $PY /tmp/rh/scripts/ritmo_lembretes.py)
 echo "$out"

@@ -89,7 +89,9 @@ def configure() -> None:
         config = yaml.safe_load(handle) or {}
     before = yaml.safe_dump(config, sort_keys=False, allow_unicode=True)
 
-    cron = config.setdefault("cron", {})
+    if not isinstance(config.get("cron"), dict):
+        config["cron"] = {}
+    cron = config["cron"]
     cron["wrap_response"] = False
     cron["mirror_delivery"] = True
     plow_chat = (config.get("platforms") or {}).get("plow_chat")
@@ -105,9 +107,14 @@ def configure() -> None:
     if after == before:
         log("config.yaml already as Ritmo needs it")
         return
+    # Same mode as the file it replaces: a new file would get the umask's
+    # default and leave the agent's config readable by everyone.
+    mode = os.stat(CONFIG).st_mode & 0o777
     temporary = CONFIG + ".ritmo-new"
-    with open(temporary, "w", encoding="utf-8") as handle:
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
         handle.write(after)
+    os.chmod(temporary, mode)
     os.replace(temporary, CONFIG)
     log("config.yaml updated (cron delivery, restart notice" + (f", timezone {zone})" if zone else ")"))
 

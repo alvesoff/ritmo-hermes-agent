@@ -20,9 +20,11 @@ COPY skills/ /opt/hermes/skills/
 COPY skills/ /tmp/ritmo-skills/
 RUN mkdir -p /opt/ritmo \
  && ls -1 /tmp/ritmo-skills > /opt/ritmo/skills.list \
- && rm -rf /tmp/ritmo-skills \
- && find /opt/hermes/skills -mindepth 1 -type d -exec chmod 0755 {} + \
- && find /opt/hermes/skills -mindepth 1 -type f -exec chmod 0644 {} +
+ && for name in $(cat /opt/ritmo/skills.list); do \
+      find "/opt/hermes/skills/$name" -type d -exec chmod 0755 {} + ; \
+      find "/opt/hermes/skills/$name" -type f -exec chmod 0644 {} + ; \
+    done \
+ && rm -rf /tmp/ritmo-skills
 
 COPY image/ritmo/ritmo_boot.py /opt/ritmo/ritmo_boot.py
 COPY image/s6-overlay/ /etc/s6-overlay/

@@ -45,8 +45,22 @@ With Docker on your own machine instead: `plow-agents deploy --local --line ln_x
 | Routine gate: wakes the LLM only when a routine is due | `skills/ritmo/scripts/ritmo_rotinas.py` |
 | Boot step: Hermes settings, scripts, job registration | `image/ritmo/ritmo_boot.py` |
 
-Tests: `python -m unittest discover -s tests`. CI also builds the image and
-runs `tests/smoke_image.sh` inside it.
+Tests: `python -m unittest discover -s tests`.
+
+## Build the image
+
+No Docker needed: the image is the pinned Plow base plus one layer of these
+files, so `tools/build_image.py` writes that layer and
+[crane](https://github.com/google/go-containerregistry) appends and pushes it
+(needs `gh` logged in with `write:packages`). Then check the exact image that
+was pushed before deploying it:
+
+```sh
+python tools/build_image.py                     # prints ghcr.io/...@sha256:...
+gh workflow run smoke -f image=<that reference> # runs tests/smoke_image.sh inside it
+```
+
+With Docker, `docker build .` produces the same image.
 
 ## License
 

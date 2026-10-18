@@ -38,9 +38,16 @@ Ids for habits and fixed commitments are short lowercase words you choose
 
 Settings keys: `name`, `language`, `timezone`, `wake`, `sleep`,
 `quiet` (`{"start","end"}`), `routines` (`morning`/`evening`: `time`, `enabled`,
-`days`; `weekly`: `day`, `time`, `enabled`), `goals`, `texts` (overrides for the
-reminder wording: `reminder`, `habit`, `fixed`, `footer`, `missed`),
-`reminder_grace_minutes`, `onboarded`.
+`days`; `weekly`: `day`, `time`, `enabled`), `goals`, `texts`,
+`reminder_grace_minutes`, `onboarded`. Booleans are JSON `true`/`false`.
+
+`texts` overrides the wording of the automatic messages. Each one may use only
+its own placeholders, spelled exactly so (in English, whatever the language):
+`reminder` and `fixed`: `{time}` `{text}`; `duration`: `{minutes}`;
+`habit`: `{text}`; `missed`: `{items}`; `footer`: none.
+
+Routines never fall inside quiet hours: a `config set` that would put one
+there is refused, so change `quiet` and the routine time in the same call.
 
 ## Onboarding
 
@@ -51,7 +58,8 @@ light. In this order:
    ("São Paulo" → `America/Sao_Paulo`) and save it with `language` (the
    language they write in).
 2. When they usually wake up and go to sleep → `wake`, `sleep`. Offer quiet
-   hours from sleep to wake and save `quiet`.
+   hours from sleep to wake and save `quiet`; if the morning brief (07:30 by
+   default) would fall inside them, move it to the wake time in the same call.
 3. Fixed commitments in their week (work hours, classes, gym) → `fixed add`.
 4. Habits they want nudges for, with how often ("water every 2h") → `habit add`.
 5. What they want to make progress on this week → `goal add`.
@@ -72,6 +80,10 @@ in this conversation's history. A reply right after one is about it:
   seems to want it, then `move` it
 - "snooze 20", "adiar 20", "in an hour" → `snooze 20` / `snooze 60`
 - "I can't today" → `skip`, then look at `list` and move what still fits
+
+A habit nudge (`⏰ Drink water`) needs no command: just acknowledge. When
+`last` is refused because the message named several items or was hours ago,
+ask which one in a short line, then use its id from `list`.
 
 When a change pushes later items, `move` them so nothing overlaps and nothing
 lands in quiet hours. Reply with the result in one or two lines.

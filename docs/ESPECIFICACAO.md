@@ -23,9 +23,20 @@ não está.
 
 ## Onboarding (primeira conversa, poucas perguntas)
 
-Nome, fuso horário, horário de acordar e de dormir, janela de silêncio, compromissos
-fixos, hábitos (com intervalo) e metas da semana. Tudo muda depois em linguagem
-natural: "muda o lembrete de água para cada 3h", "não me manda nada no sábado".
+Nome e cidade (o agente converte a cidade no fuso sozinho e confirma pela hora
+local; nunca pede "fuso horário"), horário de acordar e de dormir, janela de
+silêncio, compromissos fixos, hábitos (com intervalo), metas e o tom da cobrança.
+Tudo muda depois em linguagem natural: "muda o lembrete de água para cada 3h",
+"não me manda nada no sábado". Uma configuração interrompida continua de onde
+parou, sem repetir o que já foi respondido.
+
+**Tom**, escolhido pelo dono: gentil, direto (padrão) ou duro. No duro, o agente
+cobra pelo nome, liga a tarefa à meta do dono e não aceita "pular" sem motivo;
+em nenhum tom ele xinga, humilha ou empurra o dono contra sono, comida ou saúde.
+
+**Backup:** versão nova na Plow é agente novo, com a memória vazia. Antes de
+atualizar, o dono pede o backup e recebe uma mensagem com um código; depois
+da atualização, encaminha essa mensagem e o agente restaura tudo.
 
 O onboarding não fala do módulo Equipe.
 

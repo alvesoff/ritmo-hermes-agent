@@ -1,3 +1,4 @@
 /plow-credentials
+/.env
 .git
 __pycache__/

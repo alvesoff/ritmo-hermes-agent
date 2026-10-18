@@ -2,8 +2,8 @@
 """The one door the agent uses to read and change the owner's routine.
 
 Every command prints JSON. A refusal prints {"error": ...} and exits 1, with a
-message that says what to fix. Times are always the OWNER's wall clock; the
-agent never converts zones itself.
+message that says what to fix; nothing changed. Times are always the OWNER's
+wall clock; the agent never converts zones itself.
 
   ritmo.py now
   ritmo.py config show | set '<json>' | unset <key>
@@ -35,15 +35,21 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ritmo_core as core  # noqa: E402
 from ritmo_core import RitmoError  # noqa: E402
 
+# A planned or moved item may start this long ago and still count as "now".
+PAST_TOLERANCE = dt.timedelta(minutes=1)
+
 
 def out(payload: object) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2))
 
 
-def require_timezone(config: dict) -> None:
+def ready() -> dict:
+    """The validated config of an owner whose timezone is known."""
+    config = core.load_config()
     if not core.configured(config):
         raise RitmoError("no timezone yet: ask the owner where they live, then "
                          "`ritmo.py config set '{\"timezone\": \"Area/City\"}'`")
+    return config
 
 
 def parse_days(text: str | None) -> list[str] | None:
@@ -52,24 +58,43 @@ def parse_days(text: str | None) -> list[str] | None:
     return [part.strip().lower()[:3] for part in text.split(",") if part.strip()]
 
 
-def find(agenda: dict, ref: str) -> dict:
-    """An item by id, or `last`: the most recently reminded item still open."""
-    if ref == "last":
-        reminded = [item for item in agenda["items"] if item.get("reminded_at") and item["status"] == "pending"]
-        if not reminded:
-            raise RitmoError("no reminded item is open; list the agenda and use an id")
-        return max(reminded, key=lambda item: item["reminded_at"])
-    for item in agenda["items"]:
-        if item["id"] == ref:
-            return item
-    raise RitmoError(f"no agenda item with id {ref!r}; `ritmo.py list` shows the ids")
+def not_past(at: dt.datetime, config: dict) -> None:
+    now = core.now_in(config)
+    if core.utc(at) < core.utc(now) - PAST_TOLERANCE:
+        raise RitmoError(f"{at.strftime('%Y-%m-%d %H:%M')} is in the past for the owner "
+                         f"(now {now.strftime('%Y-%m-%d %H:%M')})")
+
+
+def find(agenda: dict, ref: str, config: dict) -> dict:
+    """An item by id, or `last`: the item the latest reminder message was about.
+
+    Only a reminder from the last few hours counts, and only when that message
+    named a single item: an old unanswered reminder, or a message listing two
+    items, needs an id instead of a guess.
+    """
+    if ref != "last":
+        for item in agenda["items"]:
+            if item["id"] == ref:
+                return item
+        raise RitmoError(f"no agenda item with id {ref!r}; `ritmo.py list` shows the ids")
+    reminded = [item for item in agenda["items"] if item.get("reminded_at") and item["status"] == "pending"]
+    if not reminded:
+        raise RitmoError("no reminded item is open; a habit nudge needs no answer, otherwise use an id from `list`")
+    latest = max(item["reminded_at"] for item in reminded)
+    if core.utc(core.now_in(config)) - core.utc(dt.datetime.fromisoformat(latest)) > core.LAST_REMINDER_WINDOW:
+        raise RitmoError("the last reminder was hours ago; use an id from `ritmo.py list`")
+    same = [item for item in reminded if item["reminded_at"] == latest]
+    if len(same) > 1:
+        options = ", ".join(f"{item['id']} ({item['text']})" for item in same)
+        raise RitmoError(f"the last reminder named several items: {options}; ask which one and use its id")
+    return same[0]
 
 
 def resolve_at(args: argparse.Namespace, config: dict) -> dt.datetime:
-    if getattr(args, "in_minutes", None) is not None:
+    if args.in_minutes is not None:
         if args.in_minutes < 1:
             raise RitmoError("--in takes a whole number of minutes, at least 1")
-        return core.now_in(config).replace(second=0, microsecond=0) + dt.timedelta(minutes=args.in_minutes)
+        return core.plus_minutes(core.now_in(config).replace(second=0, microsecond=0), args.in_minutes)
     if not args.at:
         raise RitmoError("say when: --at 'YYYY-MM-DD HH:MM', --at HH:MM or --in MINUTES")
     return core.parse_when(args.at, config)
@@ -77,89 +102,118 @@ def resolve_at(args: argparse.Namespace, config: dict) -> dt.datetime:
 
 # --- config --------------------------------------------------------------------
 
-def cmd_now(args, config):
-    require_timezone(config)
+def cmd_now(args):
+    config = ready()
     now = core.now_in(config)
     out({"now": now.isoformat(timespec="minutes"), "weekday": core.weekday_key(now.date()),
          "timezone": config["timezone"], "quiet_now": core.in_quiet(now, config)})
 
 
-def cmd_config(args, config):
+def cmd_config(args):
     if args.action == "show":
-        out(config)
-        return
-    if args.action == "set":
         try:
-            update = json.loads(args.value or "")
-        except ValueError as error:
-            raise RitmoError(f"config set takes a JSON object: {error}") from error
-        if not isinstance(update, dict):
-            raise RitmoError("config set takes a JSON object")
-        unknown = sorted(set(update) - set(core.DEFAULT_CONFIG))
-        if unknown:
-            raise RitmoError(f"unknown config keys {unknown}; valid keys: {sorted(core.DEFAULT_CONFIG)}")
-        saved = core.save_config(core.deep_merge(config, update))
-        out({"saved": update, "config": saved})
+            out(core.load_config())
+        except RitmoError as error:
+            out({"invalid": str(error), "saved": core.read_json("config.json", {})})
         return
-    if args.action == "unset":
-        if args.value not in core.DEFAULT_CONFIG or args.value == "version":
-            raise RitmoError(f"unknown config key {args.value!r}")
-        config[args.value] = core.DEFAULT_CONFIG[args.value]
-        out({"reset": args.value, "config": core.save_config(config)})
+    with core.locked():
+        # The raw file, not the validated one: these two commands are also
+        # how a broken config gets repaired.
+        saved = core.read_json("config.json", {})
+        old_zone = saved.get("timezone") if isinstance(saved.get("timezone"), str) else ""
+        if args.action == "set":
+            try:
+                update = json.loads(args.value or "")
+            except ValueError as error:
+                raise RitmoError(f"config set takes a JSON object: {error}") from error
+            if not isinstance(update, dict):
+                raise RitmoError("config set takes a JSON object")
+            unknown = sorted(set(update) - set(core.DEFAULT_CONFIG) - {"version"})
+            if unknown:
+                raise RitmoError(f"unknown config keys {unknown}; valid keys: {sorted(core.DEFAULT_CONFIG)}")
+            config = core.save_config(core.deep_merge(saved, update))
+            result = {"saved": update}
+        else:
+            if args.value not in core.DEFAULT_CONFIG or args.value == "version":
+                raise RitmoError(f"unknown config key {args.value!r}")
+            saved[args.value] = json.loads(json.dumps(core.DEFAULT_CONFIG[args.value]))
+            config = core.save_config(saved)
+            result = {"reset": args.value}
+        if old_zone and config["timezone"] and old_zone != config["timezone"]:
+            try:
+                previous = core.ZoneInfo(old_zone)
+            except (core.ZoneInfoNotFoundError, ValueError):
+                previous = None
+            if previous is not None:
+                agenda = core.load_agenda()
+                result["reanchored_items"] = core.reanchor(agenda, previous, core.zone(config))
+                core.write_json("agenda.json", agenda)
+    result["config"] = config
+    out(result)
 
 
-def cmd_habit(args, config):
-    habits = [habit for habit in config["habits"] if habit["id"] != args.id]
-    if args.action == "add":
-        habit = {"id": args.id, "text": args.text, "every_minutes": args.every,
-                 "start": args.start, "end": args.end}
-        days = parse_days(args.days)
-        if days:
-            habit["days"] = days
-        habits.append(habit)
-    elif len(habits) == len(config["habits"]):
-        raise RitmoError(f"no habit with id {args.id!r}")
-    config["habits"] = habits
-    saved = core.save_config(config)
-    out({"habits": saved["habits"]})
+def edit_config(mutate) -> dict:
+    with core.locked():
+        config = core.load_config()
+        mutate(config)
+        return core.save_config(config)
 
 
-def cmd_fixed(args, config):
-    fixed = [item for item in config["fixed"] if item["id"] != args.id]
-    if args.action == "add":
-        fixed.append({"id": args.id, "text": args.text, "days": parse_days(args.days) or [],
-                      "start": args.start, "end": args.end, "remind": not args.no_remind})
-    elif len(fixed) == len(config["fixed"]):
-        raise RitmoError(f"no fixed commitment with id {args.id!r}")
-    config["fixed"] = fixed
-    saved = core.save_config(config)
-    out({"fixed": saved["fixed"]})
+def cmd_habit(args):
+    def mutate(config):
+        before = len(config["habits"])
+        config["habits"] = [habit for habit in config["habits"] if habit["id"] != args.id]
+        if args.action == "add":
+            habit = {"id": args.id, "text": args.text, "every_minutes": args.every,
+                     "start": args.start, "end": args.end}
+            days = parse_days(args.days)
+            if days:
+                habit["days"] = days
+            config["habits"].append(habit)
+        elif len(config["habits"]) == before:
+            raise RitmoError(f"no habit with id {args.id!r}")
+
+    out({"habits": edit_config(mutate)["habits"]})
 
 
-def cmd_goal(args, config):
-    if args.action == "add":
-        config["goals"].append(args.value)
-    else:
+def cmd_fixed(args):
+    def mutate(config):
+        before = len(config["fixed"])
+        config["fixed"] = [item for item in config["fixed"] if item["id"] != args.id]
+        if args.action == "add":
+            config["fixed"].append({"id": args.id, "text": args.text, "days": parse_days(args.days) or [],
+                                    "start": args.start, "end": args.end, "remind": not args.no_remind})
+        elif len(config["fixed"]) == before:
+            raise RitmoError(f"no fixed commitment with id {args.id!r}")
+
+    out({"fixed": edit_config(mutate)["fixed"]})
+
+
+def cmd_goal(args):
+    def mutate(config):
+        if args.action == "add":
+            config["goals"].append(args.value)
+            return
         try:
             config["goals"].pop(int(args.value))
         except (ValueError, IndexError) as error:
             raise RitmoError("goal remove takes the goal's index from `config show`") from error
-    out({"goals": core.save_config(config)["goals"]})
+
+    out({"goals": edit_config(mutate)["goals"]})
 
 
 # --- agenda --------------------------------------------------------------------
 
-def cmd_add(args, config):
-    require_timezone(config)
+def cmd_add(args):
+    config = ready()
     at = resolve_at(args, config)
-    if at < core.now_in(config) - dt.timedelta(minutes=1):
-        raise RitmoError(f"{at.strftime('%Y-%m-%d %H:%M')} is in the past for the owner "
-                         f"(now {core.now_in(config).strftime('%Y-%m-%d %H:%M')})")
-    item = {"id": core.new_id(), "text": args.text.strip(), "at": at.isoformat(timespec="minutes"),
+    not_past(at, config)
+    text = args.text.strip()
+    if not text:
+        raise RitmoError("the reminder needs a text")
+    item = {"id": core.new_id(), "text": text, "at": at.isoformat(timespec="minutes"),
             "status": "pending", "source": "plan" if args.plan else "owner",
             "created": core.now_in(config).isoformat(timespec="seconds")}
-    if not item["text"]:
-        raise RitmoError("the reminder needs a text")
     if args.minutes:
         item["minutes"] = args.minutes
     if args.urgent:
@@ -174,18 +228,15 @@ def cmd_add(args, config):
     out({"added": view})
 
 
-def cmd_list(args, config):
-    require_timezone(config)
+def cmd_list(args):
+    config = ready()
     today = core.now_in(config).date()
     if args.date in (None, "today"):
         first = today
     elif args.date == "tomorrow":
         first = today + dt.timedelta(days=1)
     else:
-        try:
-            first = dt.date.fromisoformat(args.date)
-        except ValueError as error:
-            raise RitmoError("--date takes YYYY-MM-DD, today or tomorrow") from error
+        first = core.parse_date(args.date)
     last = first + dt.timedelta(days=max(args.days, 1) - 1)
     agenda = core.load_agenda()
     days = {}
@@ -196,74 +247,83 @@ def cmd_list(args, config):
     out({"days": days, "habits": config["habits"]})
 
 
-def change(ref: str, mutate) -> dict:
+def change(ref: str, config: dict, mutate) -> dict:
     with core.locked():
         agenda = core.load_agenda()
-        item = find(agenda, ref)
+        item = find(agenda, ref, config)
         mutate(item)
         core.write_json("agenda.json", agenda)
     return item
 
 
-def cmd_status(args, config):
+def cmd_status(args):
+    config = ready()
     status = {"done": "done", "skip": "skipped"}[args.command]
-    item = change(args.ref, lambda item: item.update(status=status))
+    item = change(args.ref, config, lambda item: item.update(status=status))
     out({status: core.item_view(item, config)})
 
 
-def cmd_snooze(args, config):
-    require_timezone(config)
+def cmd_snooze(args):
+    config = ready()
     if args.minutes < 1:
         raise RitmoError("snooze takes a whole number of minutes, at least 1")
-    at = core.now_in(config).replace(second=0, microsecond=0) + dt.timedelta(minutes=args.minutes)
+    at = core.plus_minutes(core.now_in(config).replace(second=0, microsecond=0), args.minutes)
 
     def mutate(item):
         item.update(at=at.isoformat(timespec="minutes"), status="pending", reminded_at=None)
 
-    out({"snoozed": core.item_view(change(args.ref, mutate), config)})
+    out({"snoozed": core.item_view(change(args.ref, config, mutate), config)})
 
 
-def cmd_move(args, config):
-    require_timezone(config)
+def cmd_move(args):
+    config = ready()
     at = core.parse_when(args.at, config)
+    not_past(at, config)
 
     def mutate(item):
         item.update(at=at.isoformat(timespec="minutes"), status="pending", reminded_at=None)
 
-    out({"moved": core.item_view(change(args.id, mutate), config)})
+    out({"moved": core.item_view(change(args.id, config, mutate), config)})
 
 
-def cmd_remove(args, config):
+def cmd_remove(args):
+    config = ready()
     with core.locked():
         agenda = core.load_agenda()
-        item = find(agenda, args.id)
+        item = find(agenda, args.id, config)
         agenda["items"].remove(item)
         core.write_json("agenda.json", agenda)
     out({"removed": core.item_view(item, config)})
 
 
-def cmd_plan(args, config):
+def cmd_plan(args):
     """Replace the planner's open items on one day; the owner's own reminders stay."""
-    require_timezone(config)
+    config = ready()
+    day = core.parse_date(args.date)
     try:
-        day = dt.date.fromisoformat(args.date)
         entries = json.loads(args.items)
     except ValueError as error:
-        raise RitmoError(f"plan takes a date and a JSON list: {error}") from error
+        raise RitmoError(f"plan takes a JSON list: {error}") from error
     if not isinstance(entries, list):
         raise RitmoError("plan takes a JSON list of {\"text\", \"time\", \"minutes\"}")
     now = core.now_in(config)
+    if day < now.date():
+        raise RitmoError(f"{day.isoformat()} is in the past for the owner (today is {now.date().isoformat()})")
     tz = core.zone(config)
     fresh = []
     for entry in entries:
         if not isinstance(entry, dict) or not str(entry.get("text", "")).strip():
             raise RitmoError("each plan entry needs a text")
         at = core.at_local(day, core.check_time(entry.get("time"), "plan time"), tz)
+        not_past(at, config)
         item = {"id": core.new_id(), "text": str(entry["text"]).strip(), "at": at.isoformat(timespec="minutes"),
                 "status": "pending", "source": "plan", "created": now.isoformat(timespec="seconds")}
-        if entry.get("minutes"):
-            item["minutes"] = int(entry["minutes"])
-        if entry.get("urgent"):
+        minutes = entry.get("minutes")
+        if minutes:
+            if not isinstance(minutes, int) or isinstance(minutes, bool) or minutes < 1:
+                raise RitmoError(f"plan minutes must be a whole number, got {minutes!r}")
+            item["minutes"] = minutes
+        if entry.get("urgent") is True:
             item["urgent"] = True
         fresh.append(item)
     with core.locked():
@@ -275,24 +335,32 @@ def cmd_plan(args, config):
         agenda["items"] = kept + fresh
         core.write_json("agenda.json", agenda)
     quiet = [core.item_view(item, config) for item in fresh
-             if core.in_quiet(dt.datetime.fromisoformat(item["at"]), config) and not item.get("urgent")]
+             if core.in_quiet(dt.datetime.fromisoformat(item["at"]).astimezone(tz), config) and not item.get("urgent")]
     result = {"planned": day.isoformat(), "items": core.items_between(agenda, config, day, day)}
     if quiet:
-        result["warning"] = {"inside_quiet_hours": quiet}
+        result["warning"] = {"inside_quiet_hours_will_wait": quiet}
     out(result)
 
 
-def cmd_doctor(args, config):
-    report = {"configured": core.configured(config), "onboarded": config["onboarded"],
-              "data_dir": core.data_dir(), "errors": ""}
+def cmd_doctor(args):
+    """What is wrong, without needing anything to be right."""
+    report = {"data_dir": core.data_dir()}
+    try:
+        config = core.load_config()
+        report.update(config_valid=True, configured=core.configured(config), onboarded=config["onboarded"])
+    except RitmoError as error:
+        report.update(config_valid=False, config_error=str(error))
+    try:
+        agenda = core.load_agenda()
+        report["agenda_items"] = len(agenda["items"])
+        report["pending"] = sum(1 for item in agenda["items"] if item.get("status") == "pending")
+    except RitmoError as error:
+        report["agenda_error"] = str(error)
     try:
         with open(core.path("errors.log"), encoding="utf-8", errors="replace") as handle:
-            report["errors"] = handle.read()[-2000:]
+            report["recent_errors"] = handle.read()[-2000:]
     except FileNotFoundError:
-        pass
-    agenda = core.load_agenda()
-    report["agenda_items"] = len(agenda["items"])
-    report["pending"] = sum(1 for item in agenda["items"] if item["status"] == "pending")
+        report["recent_errors"] = ""
     out(report)
 
 
@@ -371,10 +439,14 @@ COMMANDS = {
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
-        config = core.load_config()
-        COMMANDS[args.command](args, config)
+        COMMANDS[args.command](args)
     except RitmoError as error:
         out({"error": str(error)})
+        return 1
+    except Exception as error:  # noqa: BLE001 -- the agent reads JSON, never a traceback
+        core.log_error(f"ritmo.py {args.command}", repr(error))
+        out({"error": f"unexpected {error.__class__.__name__}: {error}. Check `ritmo.py list` "
+                      "or `ritmo.py doctor` before telling the owner anything changed"})
         return 1
     return 0
 

@@ -54,9 +54,11 @@ there is refused, so change `quiet` and the routine time in the same call.
 Ask one or two things per message, save each answer right away, and keep it
 light. In this order:
 
-1. Their name and where they live. Turn the place into an IANA zone yourself
-   ("São Paulo" → `America/Sao_Paulo`) and save it with `language` (the
-   language they write in).
+1. Their name and the city they live in. Never ask for a "timezone" and never
+   show a zone name like `America/Sao_Paulo`: turn the city into the zone
+   yourself, save it with `name` and `language` (the language they write in),
+   then run `now` and confirm in plain words ("aí agora são 19:40, certo?").
+   A wrong hour means a wrong city; ask again.
 2. When they usually wake up and go to sleep → `wake`, `sleep`. Offer quiet
    hours from sleep to wake and save `quiet`; if the morning brief (07:30 by
    default) would fall inside them, move it to the wake time in the same call.

@@ -360,6 +360,116 @@ class Replies(Home):
         self.assertIn("unknown config keys", result["error"])
 
 
+class Backup(Home):
+    def test_a_new_agent_gets_the_routine_back_from_the_forwarded_code(self):
+        self.configure(name="Ana", wake="05:20")
+        self.cli("habit", "add", "agua", "Beber água", "--every", "120", "--start", "06:00", "--end", "22:00")
+        self.cli("fixed", "add", "onibus", "Pegar ônibus", "--days", "mon,tue,wed,thu,fri", "--start", "06:20", "--end", "06:50")
+        self.at("2026-10-19T10:00:00-03:00")
+        self.cli("add", "Dentista", "--at", "2026-10-21 15:00")
+        self.cli("add", "Já passou", "--at", "10:30")
+        code, exported = self.cli("export")
+        self.assertEqual(code, 0, exported)
+        self.assertEqual(exported["items"], 2)
+        self.assertTrue(exported["code"].endswith("."))
+
+        shutil.rmtree(os.path.join(self.home, "ritmo"))  # the new agent's empty home
+        self.at("2026-10-19T11:00:00-03:00")
+        forwarded = "Guarde esta mensagem:\n" + exported["code"][:40] + "\n" + exported["code"][40:] + "\nobrigado"
+        code, restored = self.cli("import", forwarded)
+        self.assertEqual(code, 0, restored)
+        self.assertEqual(restored["restored"]["habits"], 1)
+        self.assertEqual(restored["restored"]["fixed"], 1)
+        self.assertEqual(restored["restored"]["items_added"], 1)
+        self.assertEqual([item["text"] for item in restored["expired_during_update"]], ["Já passou"],
+                         "what passed during the update is reported, not silently dropped")
+        self.assertEqual(core.load_config()["wake"], "05:20")
+        code, again = self.cli("import", exported["code"])
+        self.assertEqual(again["restored"]["items_added"], 0, "importing twice adds nothing")
+
+    def test_any_words_after_the_code_are_ignored(self):
+        self.configure(name="Ana")
+        code, exported = self.cli("export")
+        for trailer in ("ok", "oi", "bom dia", "Valeu Ritmo", "abc", "a"):
+            code, result = self.cli("import", exported["code"] + "\n" + trailer)
+            self.assertEqual(code, 0, (trailer, result))
+
+    def test_damaged_code_is_refused_without_changing_anything(self):
+        self.configure(name="Ana")
+        code, exported = self.cli("export")
+        self.configure(name="Bia", timezone="Europe/Lisbon")
+        with open(core.path("config.json"), encoding="utf-8") as handle:
+            before = handle.read()
+        code, result = self.cli("import", exported["code"][:-21] + ".")
+        self.assertEqual(code, 1)
+        self.assertIn("damaged", result["error"])
+        with open(core.path("config.json"), encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), before)
+
+    def test_send_delivers_the_code_verbatim_on_the_next_quiet_minute(self):
+        self.configure(name="Ana")
+        self.at("2026-10-19T10:00:00-03:00")
+        self.cli("add", "Treino", "--at", "10:01")
+        code, queued = self.cli("export", "--send")
+        self.assertEqual(code, 0, queued)
+        self.assertNotIn("code", queued, "the model never sees the code it would have to copy")
+        self.at("2026-10-19T10:01:00-03:00")
+        message = self.reminders()
+        self.assertIn("Treino", message)
+        self.assertNotIn("RITMO-BACKUP-1", message, "a reminder minute stays a reminder")
+        self.at("2026-10-19T10:02:00-03:00")
+        backup = self.reminders()
+        self.assertTrue(backup.startswith("RITMO-BACKUP-1:") and backup.endswith("."))
+        self.assertEqual(self.reminders(), "", "sent once")
+
+    def test_keys_from_a_newer_version_are_left_behind(self):
+        self.configure(name="Ana")
+        code, exported = self.cli("export")
+        payload = ritmo.decode_backup(exported["code"])
+        payload["config"]["future_feature"] = 1
+        packed = ritmo.zlib.compress(json.dumps(payload).encode())
+        code_text = ritmo.BACKUP_PREFIX + ritmo.base64.urlsafe_b64encode(packed).decode().rstrip("=") + "."
+        code, result = self.cli("import", code_text)
+        self.assertEqual(code, 0, result)
+        self.assertNotIn("future_feature", core.read_json("config.json", {}))
+
+
+class Setup(Home):
+    def test_config_show_says_what_setup_still_needs(self):
+        code, shown = self.cli("config", "show")
+        self.assertEqual(shown["setup"], {"needed": True, "missing": ["timezone", "name", "language", "onboarding"]})
+        self.cli("config", "set", json.dumps({"timezone": "America/Sao_Paulo", "name": "Ana"}))
+        code, shown = self.cli("config", "show")
+        self.assertEqual(shown["setup"]["missing"], ["language", "onboarding"])
+
+    def test_a_broken_config_asks_for_repair_not_onboarding(self):
+        self.configure()
+        with open(core.path("config.json"), encoding="utf-8") as handle:
+            config = json.load(handle)
+        config["quiet"] = "22:00"
+        with open(core.path("config.json"), "w", encoding="utf-8") as handle:
+            json.dump(config, handle)
+        code, shown = self.cli("config", "show")
+        self.assertEqual(shown["setup"], {"needed": False, "repair": True})
+
+    def test_abbreviated_zones_without_dst_are_refused(self):
+        code, result = self.cli("config", "set", json.dumps({"timezone": "EST"}))
+        self.assertEqual(code, 1)
+        self.assertIn("America/New_York", result["error"])
+
+    def test_tough_tone_changes_the_reminder_footer(self):
+        self.configure(tone="tough")
+        self.at("2026-10-19T17:00:00-03:00")
+        self.cli("add", "Estudar", "--at", "18:00", "--minutes", "50")
+        self.at("2026-10-19T18:00:00-03:00")
+        self.assertIn("Sem desculpa.", self.reminders())
+
+    def test_unknown_tone_refused(self):
+        code, result = self.cli("config", "set", json.dumps({"tone": "brutal"}))
+        self.assertEqual(code, 1)
+        self.assertIn("gentle, direct, tough", result["error"])
+
+
 class Routines(Home):
     def gate(self) -> dict:
         return json.loads(ritmo_rotinas.gate().splitlines()[-1])

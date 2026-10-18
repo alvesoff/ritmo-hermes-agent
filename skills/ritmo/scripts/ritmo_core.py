@@ -32,11 +32,17 @@ SCHEMA_VERSION = 1
 
 WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
+TONES = ("gentle", "direct", "tough")
+
 DEFAULT_CONFIG: dict = {
     "version": SCHEMA_VERSION,
     "name": "",
-    "language": "en",
+    # Empty until the owner's language is known: a default here would look
+    # like a choice the owner made.
+    "language": "",
     "timezone": "",
+    # How hard the agent pushes: gentle, direct (default) or tough.
+    "tone": "direct",
     "wake": "07:00",
     "sleep": "23:00",
     "quiet": {"start": "22:00", "end": "07:00"},
@@ -89,6 +95,20 @@ TEXTS: dict[str, dict[str, str]] = {
         "fixed": "📅 {time} · {text}",
         "footer": "Responde hecho, posponer 15 u omitir.",
         "missed": "Pasaron sin aviso: {items}",
+    },
+}
+
+# The reminder footer is the one line of the no-LLM messages that carries tone.
+TONE_FOOTERS: dict[str, dict[str, str]] = {
+    "gentle": {
+        "en": "When you can, reply done, snooze 15 or skip.",
+        "pt": "Quando der, responda feito, adiar 15 ou pular.",
+        "es": "Cuando puedas, responde hecho, posponer 15 u omitir.",
+    },
+    "tough": {
+        "en": "No excuses. Reply done, snooze 15 or skip.",
+        "pt": "Sem desculpa. Responda feito, adiar 15 ou pular.",
+        "es": "Sin excusas. Responde hecho, posponer 15 u omitir.",
     },
 }
 
@@ -217,13 +237,20 @@ def check_object(value: object, field: str) -> dict:
 
 
 def check_timezone(value: object) -> str:
+    """An IANA Area/City name. Abbreviations such as EST or CET exist in tzdata
+    as fixed offsets without daylight saving, so they are refused: "New York"
+    saved as EST would run an hour off for eight months a year."""
     if not isinstance(value, str) or not value.strip():
         raise RitmoError("timezone must be an IANA name such as America/Sao_Paulo")
+    name = value.strip()
+    if "/" not in name and name != "UTC":
+        raise RitmoError(f"{name!r} is an abbreviation without daylight saving; use the city's IANA name, "
+                         "such as America/New_York or Europe/Lisbon")
     try:
-        ZoneInfo(value.strip())
+        ZoneInfo(name)
     except (ZoneInfoNotFoundError, ValueError) as error:
         raise RitmoError(f"unknown timezone {value!r}: use an IANA name such as Europe/Lisbon") from error
-    return value.strip()
+    return name
 
 
 def check_id(value: object, field: str) -> str:
@@ -287,8 +314,11 @@ def validate_config(config: dict) -> dict:
         merged["timezone"] = check_timezone(merged["timezone"])
     if not isinstance(merged["name"], str):
         raise RitmoError("name must be a string")
-    if not isinstance(merged["language"], str) or not merged["language"].strip():
+    if not isinstance(merged["language"], str):
         raise RitmoError("language must be a language tag such as pt-BR or en")
+    merged["language"] = merged["language"].strip()
+    if merged["tone"] not in TONES:
+        raise RitmoError(f"tone must be one of {', '.join(TONES)}")
     check_time(merged["wake"], "wake")
     check_time(merged["sleep"], "sleep")
     quiet = merged["quiet"]
@@ -671,9 +701,55 @@ def fixed_on(config: dict, day: dt.date) -> list[dict]:
 
 
 def texts(config: dict, *, defaults_only: bool = False) -> dict[str, str]:
-    language = config["language"].split("-")[0].lower()
+    language = (config["language"] or "en").split("-")[0].lower()
     merged = dict(TEXTS["en"])
     merged.update(TEXTS.get(language, {}))
+    footers = TONE_FOOTERS.get(config.get("tone", "direct"), {})
+    if footers:
+        merged["footer"] = footers.get(language, footers["en"])
     if not defaults_only:
         merged.update({key: value for key, value in config["texts"].items() if isinstance(value, str)})
     return merged
+
+
+SETUP_FIELDS = ("timezone", "name", "language")
+
+
+def setup_status(config: dict) -> dict:
+    """What the agent decides the first reply by: one flag, not a reading of fields."""
+    missing = [field for field in SETUP_FIELDS if not config.get(field)]
+    if not config.get("onboarded"):
+        missing.append("onboarding")
+    return {"needed": bool(missing), "missing": missing}
+
+
+def new_item(text: object, at: dt.datetime, source: str, now: dt.datetime,
+             minutes: object = None, urgent: object = False) -> dict:
+    """The one way an agenda item is built, whoever asks: add, plan or a restore."""
+    clean = str(text).strip() if isinstance(text, str) else ""
+    if not clean:
+        raise RitmoError("an agenda item needs a text")
+    item = {"id": new_id(), "text": clean, "at": at.isoformat(timespec="minutes"), "status": "pending",
+            "source": "plan" if source == "plan" else "owner", "created": now.isoformat(timespec="seconds")}
+    if minutes not in (None, 0, ""):
+        if not isinstance(minutes, int) or isinstance(minutes, bool) or minutes < 1:
+            raise RitmoError(f"minutes must be a whole number of at least 1, got {minutes!r}")
+        item["minutes"] = minutes
+    if urgent is True:
+        item["urgent"] = True
+    return item
+
+
+def change_timezone(old_name: str, new_name: str) -> int:
+    """Re-anchor open items when the owner's zone changes; the caller holds the lock."""
+    if not old_name or not new_name or old_name == new_name:
+        return 0
+    try:
+        previous = ZoneInfo(old_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        return 0
+    agenda = load_agenda()
+    moved = reanchor(agenda, previous, ZoneInfo(new_name))
+    if moved:
+        write_json("agenda.json", agenda)
+    return moved

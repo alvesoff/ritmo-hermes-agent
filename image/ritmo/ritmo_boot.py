@@ -54,16 +54,19 @@ ROUTINE_PROMPT = (
     "exactly [SILENT]."
 )
 
+# `--failure-deliver local`: a failed run (a provider outage during the morning
+# brief, say) stays in `hermes cron list` instead of texting the owner a
+# technical error. The scripts themselves never fail; see ritmo_lembretes.py.
 JOB_SPECS = (
     {
         "name": "ritmo-lembretes",
         "args": ["* * * * *", "--no-agent", "--script", "ritmo_lembretes.py",
-                 "--deliver", "plow_chat", "--name", "ritmo-lembretes"],
+                 "--deliver", "plow_chat", "--failure-deliver", "local", "--name", "ritmo-lembretes"],
     },
     {
         "name": "ritmo-rotinas",
         "args": ["* * * * *", ROUTINE_PROMPT, "--script", "ritmo_rotinas.py", "--skill", "ritmo",
-                 "--deliver", "plow_chat", "--name", "ritmo-rotinas"],
+                 "--deliver", "plow_chat", "--failure-deliver", "local", "--name", "ritmo-rotinas"],
     },
 )
 

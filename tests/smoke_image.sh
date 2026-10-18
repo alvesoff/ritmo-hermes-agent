@@ -48,6 +48,7 @@ skills = rot.get("skills") or [rot.get("skill")]
 assert "ritmo" in skills, rot
 for job in (lemb, rot):
     assert job.get("deliver") == "plow_chat", job.get("deliver")
+    assert job.get("failure_deliver") == "local", {k: v for k, v in job.items() if "deliver" in k}
 config = yaml.safe_load(open("/tmp/rh/config.yaml"))
 assert config["cron"]["wrap_response"] is False
 assert config["cron"]["mirror_delivery"] is True

@@ -360,6 +360,39 @@ class Replies(Home):
         self.assertIn("unknown config keys", result["error"])
 
 
+class Backup(Home):
+    def test_a_new_agent_gets_the_routine_back_from_the_forwarded_code(self):
+        self.configure(name="Ana", wake="05:20")
+        self.cli("habit", "add", "agua", "Beber água", "--every", "120", "--start", "06:00", "--end", "22:00")
+        self.cli("fixed", "add", "onibus", "Pegar ônibus", "--days", "mon,tue,wed,thu,fri", "--start", "06:20", "--end", "06:50")
+        self.at("2026-10-19T10:00:00-03:00")
+        self.cli("add", "Dentista", "--at", "2026-10-21 15:00")
+        self.cli("add", "Já passou", "--at", "10:30")
+        code, exported = self.cli("export")
+        self.assertEqual(code, 0, exported)
+        self.assertEqual(exported["items"], 2)
+
+        shutil.rmtree(os.path.join(self.home, "ritmo"))  # the new agent's empty home
+        self.at("2026-10-19T11:00:00-03:00")
+        forwarded = "Guarde esta mensagem:\n" + exported["code"][:40] + "\n" + exported["code"][40:] + "\nobrigado"
+        code, restored = self.cli("import", forwarded)
+        self.assertEqual(code, 0, restored)
+        self.assertEqual(restored["restored"]["habits"], 1)
+        self.assertEqual(restored["restored"]["fixed"], 1)
+        self.assertEqual(restored["restored"]["items_added"], 1, "the item that passed is not restored")
+        self.assertEqual(core.load_config()["wake"], "05:20")
+        code, again = self.cli("import", exported["code"])
+        self.assertEqual(again["restored"]["items_added"], 0, "importing twice adds nothing")
+
+    def test_damaged_code_is_refused_without_changing_anything(self):
+        self.configure(name="Ana")
+        code, exported = self.cli("export")
+        code, result = self.cli("import", exported["code"][:-20])
+        self.assertEqual(code, 1)
+        self.assertIn("damaged", result["error"])
+        self.assertEqual(core.load_config()["name"], "Ana")
+
+
 class Routines(Home):
     def gate(self) -> dict:
         return json.loads(ritmo_rotinas.gate().splitlines()[-1])

@@ -19,16 +19,20 @@ wall clock; the agent never converts zones itself.
   ritmo.py move <id> --at 'YYYY-MM-DD HH:MM'
   ritmo.py remove <id>
   ritmo.py plan <YYYY-MM-DD> '<json list of {"text","time","minutes"}>'
+  ritmo.py export | import '<RITMO-BACKUP-1:...>'
   ritmo.py doctor
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import json
 import os
+import re
 import sys
+import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -342,6 +346,75 @@ def cmd_plan(args):
     out(result)
 
 
+BACKUP_PREFIX = "RITMO-BACKUP-1:"
+
+
+def cmd_export(args):
+    """The owner's setup and open future items, as one message they can forward back.
+
+    A new image on Plow is a new agent with an empty home, so this is how a
+    routine survives an update: the code travels through the owner's own chat.
+    """
+    config = core.load_config()
+    now = core.now_in(config) if core.configured(config) else None
+    agenda = core.load_agenda()
+    items = [
+        {key: item[key] for key in ("text", "at", "minutes", "urgent", "source") if key in item}
+        for item in agenda["items"]
+        if item.get("status") == "pending" and now is not None
+        and core.utc(dt.datetime.fromisoformat(item["at"])) > core.utc(now)
+    ]
+    payload = {"config": config, "items": items}
+    packed = zlib.compress(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(), 9)
+    out({"code": BACKUP_PREFIX + base64.urlsafe_b64encode(packed).decode().rstrip("="),
+         "habits": len(config["habits"]), "fixed": len(config["fixed"]), "items": len(items)})
+
+
+def cmd_import(args):
+    """Restore an exported setup: the settings replace these, future items are added."""
+    # The forwarded message may carry words around the code, or line breaks inside it.
+    match = re.search(re.escape(BACKUP_PREFIX) + r"([A-Za-z0-9_\-\s]+)", args.code)
+    if not match:
+        raise RitmoError(f"a backup starts with {BACKUP_PREFIX}; ask the owner to forward the whole message")
+    body = "".join(match.group(1).split())
+    try:
+        payload = json.loads(zlib.decompress(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))))
+    except (ValueError, zlib.error) as error:
+        raise RitmoError("the backup is incomplete or damaged; ask the owner to forward the whole message") from error
+    if not isinstance(payload, dict) or not isinstance(payload.get("config"), dict) \
+            or not isinstance(payload.get("items"), list):
+        raise RitmoError("that is not a Ritmo backup")
+    with core.locked():
+        config = core.save_config(payload["config"])
+        now = core.now_in(config) if core.configured(config) else None
+        agenda = core.load_agenda()
+        known = {(item["text"], item["at"]) for item in agenda["items"]}
+        added = 0
+        for entry in payload["items"]:
+            if not isinstance(entry, dict) or not str(entry.get("text", "")).strip():
+                continue
+            try:
+                at = dt.datetime.fromisoformat(str(entry["at"]))
+            except (KeyError, ValueError):
+                continue
+            if at.tzinfo is None or now is None or core.utc(at) <= core.utc(now):
+                continue
+            if (entry["text"], entry["at"]) in known:
+                continue
+            item = {"id": core.new_id(), "text": str(entry["text"]).strip(), "at": at.isoformat(timespec="minutes"),
+                    "status": "pending", "source": "plan" if entry.get("source") == "plan" else "owner",
+                    "created": now.isoformat(timespec="seconds")}
+            if isinstance(entry.get("minutes"), int) and not isinstance(entry.get("minutes"), bool):
+                item["minutes"] = entry["minutes"]
+            if entry.get("urgent") is True:
+                item["urgent"] = True
+            agenda["items"].append(item)
+            added += 1
+        core.write_json("agenda.json", agenda)
+    out({"restored": {"name": config["name"], "timezone": config["timezone"], "habits": len(config["habits"]),
+                      "fixed": len(config["fixed"]), "goals": len(config["goals"]), "items_added": added}})
+
+
 def cmd_doctor(args):
     """What is wrong, without needing anything to be right."""
     report = {"data_dir": core.data_dir()}
@@ -426,6 +499,10 @@ def parser() -> argparse.ArgumentParser:
     plan = sub.add_parser("plan")
     plan.add_argument("date")
     plan.add_argument("items")
+
+    sub.add_parser("export")
+    restore = sub.add_parser("import")
+    restore.add_argument("code")
     return root
 
 
@@ -433,6 +510,7 @@ COMMANDS = {
     "now": cmd_now, "config": cmd_config, "habit": cmd_habit, "fixed": cmd_fixed, "goal": cmd_goal,
     "add": cmd_add, "list": cmd_list, "done": cmd_status, "skip": cmd_status, "snooze": cmd_snooze,
     "move": cmd_move, "remove": cmd_remove, "plan": cmd_plan, "doctor": cmd_doctor,
+    "export": cmd_export, "import": cmd_import,
 }
 
 

@@ -570,6 +570,13 @@ class FakeBoard:
             return 201, {"id": demand["id"], "url": f"https://painel.example.com/tarefas?t={demand['id']}"}, {}
         if method == "GET" and path.startswith("/api/ritmo/v1/demandas?"):
             return 200, {"demandas": [dict(d, githubUrl=d.get("githubUrl")) for d in self.demands]}, {}
+        if method == "PATCH" and re.match(r"/api/ritmo/v1/demandas/\d+$", path):
+            d = self.demands[int(path.rsplit("/", 1)[1]) - 1]
+            d.update({{"dueDate": "dueDate"}.get(k, k): v for k, v in body.items()})
+            return 200, {"ok": True, "id": d["id"]}, {}
+        if method == "DELETE" and re.match(r"/api/ritmo/v1/demandas/\d+$", path):
+            self.demands[int(path.rsplit("/", 1)[1]) - 1]["deleted"] = True
+            return 200, {"ok": True}, {}
         if method == "GET" and re.match(r"/api/ritmo/v1/demandas/\d+$", path):
             d = self.demands[int(path.rsplit("/", 1)[1]) - 1]
             return 200, {**d, "url": f"https://painel.example.com/tarefas?t={d['id']}", "person": {"email": d["person"]}}, {}
@@ -646,6 +653,30 @@ class OwnerDemands(Home):
         code, result = self.cli("demand", "create", "outro", "--person", "ana", "--title", "x", "--description", "y")
         self.assertIn("not one of the team's repositories", result["error"])
         self.assertEqual(self.board.demands, [])
+
+    def test_the_owner_moves_dates_and_cleans_up(self):
+        for title in ("Subtração", "Divisão"):
+            self.cli("demand", "create", REPO, "--person", "ana", "--title", title, "--description", "x", "--due", "2026-10-20")
+        code, listed = self.cli("demand", "list", "--person", "ana", "--repo", "app")
+        self.assertEqual([d["title"] for d in listed["demands"]], ["Subtração", "Divisão"])
+        code, moved = self.cli("demand", "update", "1", "--due", "2026-10-27", "--priority", "alta")
+        self.assertEqual(code, 0, moved)
+        self.assertEqual(moved["changed"], ["dueDate", "priority"])
+        self.assertEqual((self.board.demands[0]["dueDate"], self.board.demands[0]["priority"]), ("2026-10-27", "alta"))
+        code, cleared = self.cli("demand", "update", "2", "--due", "none")
+        self.assertIsNone(self.board.demands[1]["dueDate"])
+        code, bad = self.cli("demand", "update", "2", "--due", "semana que vem")
+        self.assertIn("YYYY-MM-DD", bad["error"])
+        code, empty = self.cli("demand", "update", "2")
+        self.assertIn("say what to change", empty["error"])
+        code, gone = self.cli("demand", "delete", "2")
+        self.assertEqual(gone["deleted"]["title"], "Divisão")
+        self.assertTrue(self.board.demands[1]["deleted"])
+
+    def test_changing_demands_needs_a_connected_board(self):
+        core.save_team(dict(self.team, board={"type": "github", "url": ""}))
+        code, result = self.cli("demand", "update", "1", "--due", "2026-10-27")
+        self.assertIn("connected board", result["error"])
 
     def test_projects_are_listed_and_created_once(self):
         code, made = self.cli("project", "create", "--person", "ana", "--name", "Calculadora")

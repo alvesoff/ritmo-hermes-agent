@@ -502,6 +502,20 @@ class RestoreFromChat(Home):
                          "another person's chat, a group and Ritmo's own mirrored export are never read")
         self.assertEqual(core.load_config()["wake"], "05:20")
 
+    def test_a_markdown_escaped_message_still_restores(self):
+        escaped = self.mine.replace("_", "\\_").replace("-", "\\-").replace(".", "\\.")
+        for cut in range(40, 60):  # wherever the line breaks, even right after a backslash
+            os.path.exists(os.path.join(self.home, "state.db")) and os.remove(os.path.join(self.home, "state.db"))
+            self.chat_store(("s-owner", escaped[:cut] + "\n" + escaped[cut:], 1))
+            code, restored = self.restore()
+            self.assertEqual(code, 0, (cut, restored))
+            self.assertEqual(restored["restored"]["name"], "Ana")
+        os.remove(os.path.join(self.home, "state.db"))
+        mirrored = "\\[Cron delivery: ritmo\\-lembretes\\]\n" + self.theirs.replace("-", "\\-")
+        self.chat_store(("s-owner", mirrored, 1))
+        code, result = self.restore()
+        self.assertEqual(code, 1, "an escaped mirror of Ritmo's own export is still not the owner's")
+
     def test_a_chat_that_moved_to_a_new_session_still_counts(self):
         self.chat_store(("s-owner-before", self.mine, 2))
         code, restored = self.restore()

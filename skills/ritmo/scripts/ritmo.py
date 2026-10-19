@@ -377,8 +377,14 @@ def cmd_export(args):
     out({"code": code, **summary})
 
 
+def unescape(text: str) -> str:
+    """The chat stores incoming text markdown-escaped (`\\_`, `\\-`); a real restore tripped on it."""
+    # A line break can fall between the backslash and what it escapes.
+    return re.sub(r"\\(?=\s*[_\-.\[\]])", "", text)
+
+
 def decode_backup(text: str) -> dict:
-    match = BACKUP_PATTERN.search(text)
+    match = BACKUP_PATTERN.search(unescape(text))
     if not match:
         raise RitmoError(f"a backup starts with {BACKUP_PREFIX} and ends with a dot; ask the owner to forward "
                          "the whole backup message")
@@ -457,7 +463,8 @@ def backup_from_chat() -> dict:
                 # as bytes: LIKE stops at the NUL that starts a stored list of parts.
                 rows = connection.execute(
                     """SELECT m.content FROM messages m JOIN sessions s ON s.id = m.session_id
-                       WHERE m.role = 'user' AND instr(CAST(m.content AS BLOB), CAST('RITMO-BACKUP-1:' AS BLOB)) > 0
+                       WHERE m.role = 'user' AND (instr(CAST(m.content AS BLOB), CAST('BACKUP-1:' AS BLOB)) > 0
+                            OR instr(CAST(m.content AS BLOB), CAST('BACKUP\\-1:' AS BLOB)) > 0)
                          AND (m.session_id = ? OR (? != '' AND s.chat_id = ? AND s.chat_type = 'dm'))
                        ORDER BY m.timestamp DESC, m.id DESC LIMIT 20""", (session, chat, chat)).fetchall()
             finally:
@@ -471,7 +478,7 @@ def backup_from_chat() -> dict:
             import time
             time.sleep(0.2)
     for (content,) in rows or []:
-        words = owner_words(message_text(content))
+        words = owner_words(unescape(message_text(content)))
         if BACKUP_PREFIX in words:
             # The last code in the message: anything before it is quoted or older.
             codes = [m.group(0) for m in BACKUP_PATTERN.finditer(words)]

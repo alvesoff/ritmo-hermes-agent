@@ -22,7 +22,11 @@ def load_updater(root: str):
     spec = importlib.util.spec_from_file_location("ritmo_update_under_test",
                                                   os.path.join(REPO, "image", "ritmo", "ritmo_update.py"))
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    sys.dont_write_bytecode, before = True, sys.dont_write_bytecode
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = before
     return module
 
 

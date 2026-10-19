@@ -38,6 +38,7 @@ class Layer(unittest.TestCase):
         shipped = {target for _, target, _ in build_image.FILES}
         image_files = []
         for current, dirs, files in os.walk(os.path.join(ROOT, "image")):
+            dirs[:] = [d for d in dirs if d != "__pycache__"]
             image_files += [os.path.relpath(os.path.join(current, n), ROOT).replace(os.sep, "/") for n in files]
         listed = {source for source, _, _ in build_image.FILES}
         self.assertEqual(set(image_files) - listed, set(), "a file under image/ is not in build_image.FILES")

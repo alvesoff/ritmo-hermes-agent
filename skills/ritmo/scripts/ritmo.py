@@ -438,7 +438,8 @@ def cmd_import(args):
             core.write_json("equipe.json", payload["team"])
         # Items the new agent already had follow the restored zone, like any zone change.
         core.change_timezone(old_zone, config["timezone"])
-    out({"restored": {"name": config["name"], "timezone": config["timezone"], "tone": config["tone"],
+    out({"restored": {"name": config["name"], "language": config["language"], "timezone": config["timezone"],
+                      "tone": config["tone"],
                       "habits": len(config["habits"]), "fixed": len(config["fixed"]), "goals": len(config["goals"]),
                       "items_added": len(added), "team": isinstance(payload.get("team"), dict)},
          **({"reconnect": "the team settings came back; connect GitHub and the board again (equipe skill)"}

@@ -16,11 +16,12 @@ Three things, each idempotent, each unable to stop the agent from starting:
 2. The cron scripts, copied into $HERMES_HOME/scripts (the only place Hermes
    runs job scripts from) from the root-owned copy in the image, every boot, so
    an edit made by a turn never outlives a restart.
-3. The two jobs, registered once and re-registered only when their spec in this
-   file changes:
+3. The jobs, registered once and re-registered only when their spec changes:
    - ritmo-lembretes: no_agent, every minute; prints due reminders or nothing.
    - ritmo-rotinas: agent job, every minute, gated by a script that wakes the
      LLM only when a routine is due in the owner's timezone.
+   - ritmo-equipe: agent job every 5 minutes on the review model, gated by a
+     script that wakes the LLM only when a pull request needs it.
 
 Both deliver to the bare `plow_chat` target, which Hermes resolves to the
 owner's home chat at delivery time: a re-minted credential or a new chat id
@@ -43,9 +44,13 @@ CONFIG = os.path.join(HOME, "config.yaml")
 JOBS = os.path.join(HOME, "cron", "jobs.json")
 SCRIPTS = os.path.join(HOME, "scripts")
 FINGERPRINT = os.path.join(HOME, "ritmo", "jobs.fingerprint")
-SOURCE = os.environ.get("RITMO_SCRIPTS_SOURCE", "/opt/hermes/skills/ritmo/scripts")
+SKILLS = os.environ.get("RITMO_SKILLS_SOURCE", "/opt/hermes/skills")
 HERMES = os.environ.get("RITMO_HERMES_BIN", "/opt/hermes/bin/hermes")
-PUBLISHED = ("ritmo_core.py", "ritmo_lembretes.py", "ritmo_rotinas.py")
+PUBLISHED = (
+    ("ritmo", "ritmo_core.py"), ("ritmo", "ritmo_lembretes.py"), ("ritmo", "ritmo_rotinas.py"),
+    ("ritmo-equipe", "equipe_core.py"), ("ritmo-equipe", "equipe.py"), ("ritmo-equipe", "equipe_gate.py"),
+)
+DEFAULT_REVIEW_MODEL = "anthropic/claude-sonnet-5"
 
 ROUTINE_PROMPT = (
     "A Ritmo routine is due. The JSON block above names it in `routine` (morning, evening or weekly) "
@@ -57,18 +62,44 @@ ROUTINE_PROMPT = (
 # `--failure-deliver local`: a failed run (a provider outage during the morning
 # brief, say) stays in `hermes cron list` instead of texting the owner a
 # technical error. The scripts themselves never fail; see ritmo_lembretes.py.
-JOB_SPECS = (
-    {
-        "name": "ritmo-lembretes",
-        "args": ["* * * * *", "--no-agent", "--script", "ritmo_lembretes.py",
-                 "--deliver", "plow_chat", "--failure-deliver", "local", "--name", "ritmo-lembretes"],
-    },
-    {
-        "name": "ritmo-rotinas",
-        "args": ["* * * * *", ROUTINE_PROMPT, "--script", "ritmo_rotinas.py", "--skill", "ritmo",
-                 "--deliver", "plow_chat", "--failure-deliver", "local", "--name", "ritmo-rotinas"],
-    },
+EQUIPE_PROMPT = (
+    "Ritmo team work is due. The JSON block above lists the work items (review, retry_merge, promote). "
+    "Follow the ritmo-equipe skill's 'When the ritmo-equipe job wakes you' section, then write one short "
+    "message to the owner, in their language and tone. If nothing deserves their attention, answer exactly "
+    "[SILENT]."
 )
+
+
+def review_model() -> str:
+    """The model the owner chose for reviews (equipe.json), Plow's Claude Sonnet by default."""
+    try:
+        with open(os.path.join(HOME, "ritmo", "equipe.json"), encoding="utf-8") as handle:
+            model = json.load(handle).get("review_model")
+    except (OSError, ValueError, AttributeError):
+        model = None
+    return model if isinstance(model, str) and model.strip() else DEFAULT_REVIEW_MODEL
+
+
+def job_specs() -> tuple:
+    return (
+        {
+            "name": "ritmo-lembretes",
+            "args": ["* * * * *", "--no-agent", "--script", "ritmo_lembretes.py",
+                     "--deliver", "plow_chat", "--failure-deliver", "local", "--name", "ritmo-lembretes"],
+        },
+        {
+            "name": "ritmo-rotinas",
+            "args": ["* * * * *", ROUTINE_PROMPT, "--script", "ritmo_rotinas.py", "--skill", "ritmo",
+                     "--deliver", "plow_chat", "--failure-deliver", "local", "--name", "ritmo-rotinas"],
+        },
+        # Reviews read code: they run on the review model, the rest of the agent on the base's cheaper one.
+        {
+            "name": "ritmo-equipe",
+            "args": ["*/5 * * * *", EQUIPE_PROMPT, "--script", "equipe_gate.py", "--skill", "ritmo-equipe",
+                     "--model", review_model(), "--deliver", "plow_chat", "--failure-deliver", "local",
+                     "--name", "ritmo-equipe"],
+        },
+    )
 
 
 def log(message: str) -> None:
@@ -121,8 +152,8 @@ def configure() -> None:
 
 def publish_scripts() -> None:
     os.makedirs(SCRIPTS, exist_ok=True)
-    for name in PUBLISHED:
-        shutil.copyfile(os.path.join(SOURCE, name), os.path.join(SCRIPTS, name))
+    for skill, name in PUBLISHED:
+        shutil.copyfile(os.path.join(SKILLS, skill, "scripts", name), os.path.join(SCRIPTS, name))
     log(f"published {len(PUBLISHED)} scripts to {SCRIPTS}")
 
 
@@ -140,13 +171,14 @@ def hermes(*args: str) -> subprocess.CompletedProcess:
     return subprocess.run([HERMES, "cron", *args], capture_output=True, text=True, timeout=90)
 
 
-def fingerprint() -> str:
-    spec = json.dumps([job["args"] for job in JOB_SPECS], sort_keys=True)
+def fingerprint(specs: tuple) -> str:
+    spec = json.dumps([job["args"] for job in specs], sort_keys=True)
     return hashlib.sha256(spec.encode()).hexdigest()
 
 
 def register_jobs() -> None:
-    wanted = fingerprint()
+    specs = job_specs()
+    wanted = fingerprint(specs)
     try:
         with open(FINGERPRINT, encoding="utf-8") as handle:
             current = handle.read().strip()
@@ -154,7 +186,7 @@ def register_jobs() -> None:
         current = ""
     jobs = registered()
     names = {job.get("name") for job in jobs}
-    if current == wanted and all(spec["name"] in names for spec in JOB_SPECS):
+    if current == wanted and all(spec["name"] in names for spec in specs):
         log("jobs already registered")
         return
     for job in jobs:
@@ -162,7 +194,7 @@ def register_jobs() -> None:
             result = hermes("remove", str(job["id"]))
             log(f"removed old {job.get('name')}: rc={result.returncode}")
     failed = False
-    for spec in JOB_SPECS:
+    for spec in specs:
         result = hermes("create", *spec["args"])
         output = (result.stdout + result.stderr).strip()
         if result.returncode != 0:

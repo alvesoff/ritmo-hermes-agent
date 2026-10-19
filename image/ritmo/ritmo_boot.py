@@ -63,7 +63,7 @@ ROUTINE_PROMPT = (
 # brief, say) stays in `hermes cron list` instead of texting the owner a
 # technical error. The scripts themselves never fail; see ritmo_lembretes.py.
 EQUIPE_PROMPT = (
-    "Ritmo team work is due. The JSON block above lists the work items (review, retry_merge, promote). "
+    "Ritmo team work is due. The JSON block above lists PRs to review and notices to report. "
     "Follow the ritmo-equipe skill's 'When the ritmo-equipe job wakes you' section, then write one short "
     "message to the owner, in their language and tone. If nothing deserves their attention, answer exactly "
     "[SILENT]."

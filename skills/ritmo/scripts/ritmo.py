@@ -392,9 +392,56 @@ def decode_backup(text: str) -> dict:
     return payload
 
 
+CHAT_WINDOW_S = 30 * 60
+
+
+def backup_from_chat() -> dict:
+    """The newest backup code the owner sent in the last 30 minutes, read from the agent's own
+    message store, exactly as it arrived.
+
+    Copying 600 random characters into a command is where a restore broke in a real test: one
+    wrong character and the whole routine is lost. Read from Hermes' state.db, the code is never
+    retyped. Only one-to-one chats count; a code posted in a group is never picked up, and neither
+    is Ritmo's own `export --send` (Hermes mirrors its deliveries into the chat as user turns).
+    """
+    import sqlite3
+    import time
+    database = os.path.join(core.home(), "state.db")
+    if not os.path.exists(database):
+        raise RitmoError("no conversation store found; pass the code itself")
+    try:
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=10)
+    except sqlite3.Error as error:
+        raise RitmoError(f"could not open the conversation store ({error}); pass the code itself") from error
+    try:
+        rows = connection.execute(
+            """SELECT m.content FROM messages m LEFT JOIN sessions s ON s.id = m.session_id
+               WHERE m.role = 'user' AND m.content LIKE '%RITMO-BACKUP-1:%' AND m.timestamp > ?
+                 AND m.content NOT LIKE '[Cron delivery:%' AND s.chat_type = 'dm'
+               ORDER BY m.timestamp DESC LIMIT 5""", (time.time() - CHAT_WINDOW_S,)).fetchall()
+    except sqlite3.Error as error:
+        raise RitmoError(f"could not read the conversation store ({error}); pass the code itself") from error
+    finally:
+        connection.close()
+    if not rows:
+        raise RitmoError("no backup message from the owner in the last 30 minutes; ask them to send it again")
+    last_error = None
+    for (content,) in rows:
+        try:
+            return decode_backup(str(content or ""))
+        except RitmoError as error:
+            last_error = error
+    raise last_error
+
+
 def cmd_import(args):
     """Restore an exported setup. Everything is checked first; nothing is written on a refusal."""
-    payload = decode_backup(args.code)
+    if args.from_chat:
+        payload = backup_from_chat()
+    elif args.code:
+        payload = decode_backup(args.code)
+    else:
+        raise RitmoError("use `import --from-chat` (reads the owner's message as it arrived)")
     # Keys a newer Ritmo knows and this one does not are left behind.
     settings = {key: value for key, value in payload["config"].items() if key in core.DEFAULT_CONFIG}
     config = core.validate_config(settings)
@@ -537,7 +584,8 @@ def parser() -> argparse.ArgumentParser:
     export = sub.add_parser("export")
     export.add_argument("--send", action="store_true", help="deliver the code to the owner verbatim, no copying")
     restore = sub.add_parser("import")
-    restore.add_argument("code")
+    restore.add_argument("code", nargs="?")
+    restore.add_argument("--from-chat", action="store_true", help="read the code from the owner's message as it arrived")
     return root
 
 

@@ -436,6 +436,50 @@ class Backup(Home):
         self.assertTrue(backup.startswith("RITMO-BACKUP-1:") and backup.endswith("."))
         self.assertEqual(self.reminders(), "", "sent once")
 
+    def chat_store(self, *messages):
+        """A Hermes state.db holding `(chat_type, content, minutes_ago)` user messages."""
+        import sqlite3
+        import time
+        connection = sqlite3.connect(os.path.join(self.home, "state.db"))
+        connection.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT NOT NULL, chat_type TEXT)")
+        connection.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, "
+                           "role TEXT NOT NULL, content TEXT, timestamp REAL NOT NULL, api_content TEXT)")
+        connection.executemany("INSERT INTO sessions VALUES (?, 'plow_chat', ?)", [("dm", "dm"), ("group", "group")])
+        for chat_type, content, minutes_ago in messages:
+            connection.execute("INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'user', ?, ?)",
+                               (chat_type, content, time.time() - minutes_ago * 60))
+        connection.commit()
+        connection.close()
+
+    def test_restore_reads_the_code_from_the_owners_message_as_it_arrived(self):
+        self.configure(name="Ana", wake="05:20")
+        code, mine = self.cli("export")
+        self.configure(name="Intruso", wake="09:00")
+        code, theirs = self.cli("export")
+        shutil.rmtree(os.path.join(self.home, "ritmo"))
+        self.chat_store(
+            ("dm", "Guarde:\n" + mine["code"][:50] + "\n" + mine["code"][50:], 3),
+            ("group", theirs["code"], 1),
+            ("dm", "[Cron delivery: ritmo-lembretes]\n" + theirs["code"], 1),
+            ("dm", theirs["code"], 45),
+        )
+        code, restored = self.cli("import", "--from-chat")
+        self.assertEqual(code, 0, restored)
+        self.assertEqual(restored["restored"]["name"], "Ana",
+                         "a group chat, Ritmo's own mirrored export and an old message are never read")
+        self.assertEqual(core.load_config()["wake"], "05:20")
+
+    def test_restore_from_chat_without_a_recent_message_asks_again(self):
+        self.configure(name="Ana")
+        before = core.load_config()
+        code, result = self.cli("import", "--from-chat")
+        self.assertEqual(code, 1)
+        self.chat_store(("dm", "oi", 1))
+        code, result = self.cli("import", "--from-chat")
+        self.assertEqual(code, 1)
+        self.assertIn("send it again", result["error"])
+        self.assertEqual(core.load_config(), before)
+
     def test_keys_from_a_newer_version_are_left_behind(self):
         self.configure(name="Ana")
         code, exported = self.cli("export")

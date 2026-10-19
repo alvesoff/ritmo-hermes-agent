@@ -42,7 +42,9 @@ Settings keys: `name`, `language`, `timezone`, `tone` (`gentle`, `direct` or
 `tough`), `wake`, `sleep`,
 `quiet` (`{"start","end"}`), `routines` (`morning`/`evening`: `time`, `enabled`,
 `days`; `weekly`: `day`, `time`, `enabled`), `goals`, `texts`,
-`reminder_grace_minutes`, `onboarded`. Booleans are JSON `true`/`false`.
+`reminder_grace_minutes`, `onboarded`, `auto_update` (code fixes install by
+themselves, keeping everything; `false` only if the owner asks to stop them).
+Booleans are JSON `true`/`false`.
 
 `texts` overrides the wording of the automatic messages. Each one may use only
 its own placeholders, spelled exactly so (in English, whatever the language):

@@ -57,6 +57,8 @@ DEFAULT_CONFIG: dict = {
     "texts": {},
     "reminder_grace_minutes": 120,
     "onboarded": False,
+    # Code fixes arrive from the published releases without recreating the agent.
+    "auto_update": True,
 }
 
 # The fixed wording of the no-LLM messages, and the placeholders each may use.
@@ -386,6 +388,7 @@ def validate_config(config: dict) -> dict:
     if not isinstance(grace, int) or isinstance(grace, bool) or grace < 5:
         raise RitmoError("reminder_grace_minutes must be a whole number of at least 5")
     check_bool(merged["onboarded"], "onboarded")
+    check_bool(merged["auto_update"], "auto_update")
     return merged
 
 

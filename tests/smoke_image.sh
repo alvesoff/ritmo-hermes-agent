@@ -111,13 +111,42 @@ restored=$($AS_AGENT HERMES_SESSION_ID=s-smoke HERMES_SESSION_CHAT_ID=cht_smoke 
   || fail "import --from-chat failed against Hermes' real state.db: $restored"
 echo "$restored" | grep -q '"timezone": "America/Sao_Paulo"' || fail "import --from-chat restored something else: $restored"
 
-echo "== the home copy of the skills is read-only for the agent"
+echo "== the home copy of the skills comes back from the image; /opt stays out of the agent's reach"
 mkdir -p /var/lib/hermes/skills && chown hermes:hermes /var/lib/hermes/skills
+printf 'ritmo:abc\nother:def\n' > /var/lib/hermes/skills/.bundled_manifest
+chown hermes:hermes /var/lib/hermes/skills/.bundled_manifest
 /etc/cont-init.d/40-ritmo-skills
 [ -f /var/lib/hermes/skills/ritmo/scripts/ritmo.py ] || fail "40-ritmo-skills did not copy the skill"
-! /command/s6-setuidgid hermes sh -c 'echo x >> /var/lib/hermes/skills/ritmo/scripts/ritmo.py' 2>/dev/null \
-  || fail "the agent can still patch its own ritmo.py"
-/command/s6-setuidgid hermes cat /var/lib/hermes/skills/ritmo/SKILL.md >/dev/null || fail "the agent cannot read its skill"
-/etc/cont-init.d/40-ritmo-skills  # a second boot leaves it alone and still read-only
+[ "$(stat -c %U /var/lib/hermes/skills/ritmo/SKILL.md)" = hermes ] || fail "the home copy is not the agent's"
+! grep -q '^ritmo:' /var/lib/hermes/skills/.bundled_manifest || fail "the manifest line was not dropped"
+grep -q '^other:' /var/lib/hermes/skills/.bundled_manifest || fail "the manifest lost another skill's line"
+! /command/s6-setuidgid hermes sh -c 'echo x >> /opt/hermes/skills/ritmo/scripts/ritmo.py' 2>/dev/null \
+  || fail "the agent can patch the scripts it runs"
+/command/s6-setuidgid hermes sh -c 'echo "patched by the agent" >> /var/lib/hermes/skills/ritmo/SKILL.md'
+/command/s6-setuidgid hermes ln -s /etc/passwd /var/lib/hermes/skills/.bundled_manifest.ritmo-new
+before=$(md5sum /etc/passwd)
+/etc/cont-init.d/40-ritmo-skills
+! grep -q "patched by the agent" /var/lib/hermes/skills/ritmo/SKILL.md || fail "a patched skill was not restored"
+[ "$(md5sum /etc/passwd)" = "$before" ] && [ "$(stat -c %U /etc/passwd)" = root ] \
+  || fail "a symlink planted in the home made root write elsewhere"
+
+echo "== the updater installs a release, after its tests pass on this image as the agent"
+[ -d /src ] || fail "the workflow did not mount the checkout at /src"
+[ -f /etc/s6-overlay/s6-rc.d/ritmo-update/run ] && [ -x /etc/s6-overlay/s6-rc.d/ritmo-update/run ] \
+  || fail "the ritmo-update service is missing"
+[ -f /etc/s6-overlay/s6-rc.d/user/contents.d/ritmo-update ] || fail "ritmo-update is not started"
+grep -q '"commit"' /opt/ritmo/installed.json || fail "the image does not say which commit it is"
+rm -rf /tmp/src && cp -a /src /tmp/src && rm -rf /tmp/src/.git
+echo "<!-- changed by the smoke -->" >> /tmp/src/runtime/persona.md
+$PY /opt/ritmo/ritmo_update.py --source /tmp/src || fail "the updater failed: $(cat /run/ritmo/update_status.json 2>&1)"
+cat /run/ritmo/update_status.json
+grep -q '"state": "installed"' /run/ritmo/update_status.json || fail "the release was not installed"
+grep -q "changed by the smoke" /opt/hermes/plow-seed/persona.md || fail "the persona was not updated"
+grep -q "changed by the smoke" /var/lib/hermes/SOUL.md || fail "SOUL.md was not recomposed"
+[ "$(stat -c %U /var/lib/hermes/SOUL.md)" = root ] || fail "SOUL.md is not root-owned"
+! /command/s6-setuidgid hermes sh -c 'echo x >> /opt/hermes/skills/ritmo/scripts/ritmo.py' 2>/dev/null \
+  || fail "after an update the agent can patch /opt"
+$AS_AGENT python3 /opt/hermes/skills/ritmo/scripts/ritmo.py doctor | grep -q '"state": "installed"' \
+  || fail "doctor does not report the update"
 
 echo "SMOKE OK"

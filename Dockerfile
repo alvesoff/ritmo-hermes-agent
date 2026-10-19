@@ -33,11 +33,15 @@ RUN mkdir -p /opt/ritmo \
     done \
  && rm -rf /tmp/ritmo-skills
 
-COPY image/ritmo/ritmo_boot.py image/ritmo/github_app.json /opt/ritmo/
+# The commit this image is built from: the updater installs only releases ahead of it.
+ARG RITMO_COMMIT=""
+COPY image/ritmo/ritmo_boot.py image/ritmo/github_app.json image/ritmo/ritmo_update.py image/ritmo/update.json /opt/ritmo/
+RUN printf '{"commit": "%s", "tag": "image"}' "$RITMO_COMMIT" > /opt/ritmo/installed.json
 COPY image/s6-overlay/ /etc/s6-overlay/
 COPY image/cont-init.d/40-ritmo-skills image/cont-init.d/41-ritmo-refresh-persona /etc/cont-init.d/
 RUN chown -R root:root /opt/ritmo \
  && chmod 0644 /opt/ritmo/ritmo_boot.py /opt/ritmo/github_app.json /opt/ritmo/skills.list \
- && chmod 0755 /etc/s6-overlay/scripts/ritmo-boot.sh \
+                /opt/ritmo/ritmo_update.py /opt/ritmo/update.json /opt/ritmo/installed.json \
+ && chmod 0755 /etc/s6-overlay/scripts/ritmo-boot.sh /etc/s6-overlay/s6-rc.d/ritmo-update/run \
                /etc/cont-init.d/40-ritmo-skills \
                /etc/cont-init.d/41-ritmo-refresh-persona

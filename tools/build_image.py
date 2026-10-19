@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import os
 import re
 import shutil
@@ -38,6 +39,15 @@ FILES = [
     ("image/ritmo/ritmo_boot.py", "opt/ritmo/ritmo_boot.py", 0o644),
     # The GitHub App the Team module connects through (public client id; no secret anywhere).
     ("image/ritmo/github_app.json", "opt/ritmo/github_app.json", 0o644),
+    # The updater: installs newer releases over these files without recreating the agent.
+    ("image/ritmo/ritmo_update.py", "opt/ritmo/ritmo_update.py", 0o644),
+    ("image/ritmo/update.json", "opt/ritmo/update.json", 0o644),
+    ("image/s6-overlay/s6-rc.d/ritmo-update/type", "etc/s6-overlay/s6-rc.d/ritmo-update/type", 0o644),
+    ("image/s6-overlay/s6-rc.d/ritmo-update/run", "etc/s6-overlay/s6-rc.d/ritmo-update/run", 0o755),
+    ("image/s6-overlay/s6-rc.d/ritmo-update/dependencies.d/ritmo-boot",
+     "etc/s6-overlay/s6-rc.d/ritmo-update/dependencies.d/ritmo-boot", 0o644),
+    ("image/s6-overlay/s6-rc.d/user/contents.d/ritmo-update",
+     "etc/s6-overlay/s6-rc.d/user/contents.d/ritmo-update", 0o644),
     ("image/s6-overlay/scripts/ritmo-boot.sh", "etc/s6-overlay/scripts/ritmo-boot.sh", 0o755),
     ("image/s6-overlay/s6-rc.d/ritmo-boot/type", "etc/s6-overlay/s6-rc.d/ritmo-boot/type", 0o644),
     ("image/s6-overlay/s6-rc.d/ritmo-boot/up", "etc/s6-overlay/s6-rc.d/ritmo-boot/up", 0o644),
@@ -54,6 +64,8 @@ NEW_DIRS = [
     "opt/ritmo",
     "etc/s6-overlay/s6-rc.d/ritmo-boot",
     "etc/s6-overlay/s6-rc.d/ritmo-boot/dependencies.d",
+    "etc/s6-overlay/s6-rc.d/ritmo-update",
+    "etc/s6-overlay/s6-rc.d/ritmo-update/dependencies.d",
 ]
 TEXT_SUFFIXES = (".md", ".py", ".sh", ".list", "")
 
@@ -109,7 +121,8 @@ def skill_entries() -> list[tuple[str, str]]:
     return entries
 
 
-def write_layer(path: str) -> None:
+def write_layer(path: str, commit: str = "") -> None:
+    """`commit` is what the updater compares releases against; empty takes any release."""
     skills = sorted(d for d in os.listdir(os.path.join(ROOT, "skills"))
                     if os.path.isdir(os.path.join(ROOT, "skills", d)))
     with tarfile.open(path, "w", format=tarfile.PAX_FORMAT) as tar:
@@ -129,6 +142,7 @@ def write_layer(path: str) -> None:
         for repo_path, image_path, mode in FILES:
             add_file(tar, image_path, read(repo_path), mode)
         add_file(tar, "opt/ritmo/skills.list", ("\n".join(skills) + "\n").encode(), 0o644)
+        add_file(tar, "opt/ritmo/installed.json", json.dumps({"commit": commit, "tag": "image"}).encode(), 0o644)
 
 
 def main() -> int:
@@ -138,7 +152,8 @@ def main() -> int:
     args = parser.parse_args()
 
     commit = run("git", "-C", ROOT, "rev-parse", "HEAD", capture=True)
-    if run("git", "-C", ROOT, "status", "--porcelain", capture=True):
+    clean = not run("git", "-C", ROOT, "status", "--porcelain", capture=True)
+    if not clean:
         print("build_image: the working tree has uncommitted changes; the image will not match a commit",
               file=sys.stderr)
     tag = args.tag or f"sha-{commit[:12]}"
@@ -152,7 +167,7 @@ def main() -> int:
         run(crane, "auth", "login", "ghcr.io", "-u", user, "--password-stdin", stdin=token, capture=True, env=env)
 
         layer = os.path.join(workdir, "ritmo-layer.tar")
-        write_layer(layer)
+        write_layer(layer, commit if clean else "")
         staging = f"{IMAGE}:build-{commit[:12]}"
         print(f"build_image: appending {os.path.getsize(layer)} bytes to {base_reference()}", file=sys.stderr)
         run(crane, "append", "--platform", "linux/amd64", "-b", base_reference(), "-f", layer, "-t", staging, env=env)

@@ -31,5 +31,5 @@ jobs:
           IMAGE: ${{ inputs.image }}
         run: |
           case "$IMAGE" in *@sha256:*) ;; *) echo "pass the image by digest" >&2; exit 1 ;; esac
-          docker run --rm --platform linux/amd64 --entrypoint /bin/sh -v "$PWD/tests:/tests:ro" "$IMAGE" /tests/smoke_image.sh
+          docker run --rm --platform linux/amd64 --entrypoint /bin/sh -v "$PWD/tests:/tests:ro" -v "$PWD:/src:ro" "$IMAGE" /tests/smoke_image.sh
           echo "Smoke OK: \`$IMAGE\`" >> "$GITHUB_STEP_SUMMARY"

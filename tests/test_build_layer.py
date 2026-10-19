@@ -38,6 +38,7 @@ class Layer(unittest.TestCase):
         shipped = {target for _, target, _ in build_image.FILES}
         image_files = []
         for current, dirs, files in os.walk(os.path.join(ROOT, "image")):
+            dirs[:] = [d for d in dirs if d != "__pycache__"]
             image_files += [os.path.relpath(os.path.join(current, n), ROOT).replace(os.sep, "/") for n in files]
         listed = {source for source, _, _ in build_image.FILES}
         self.assertEqual(set(image_files) - listed, set(), "a file under image/ is not in build_image.FILES")
@@ -47,7 +48,7 @@ class Layer(unittest.TestCase):
         for name, member in self.members.items():
             self.assertEqual((member.uid, member.gid), (0, 0), name)
         executables = {"etc/s6-overlay/scripts/ritmo-boot.sh", "etc/cont-init.d/40-ritmo-skills",
-                       "etc/cont-init.d/41-ritmo-refresh-persona"}
+                       "etc/cont-init.d/41-ritmo-refresh-persona", "etc/s6-overlay/s6-rc.d/ritmo-update/run"}
         for name in executables:
             self.assertEqual(self.members[name].mode, 0o755, name)
         self.assertEqual(self.members["opt/hermes/skills/ritmo/scripts/ritmo.py"].mode, 0o644)

@@ -1,5 +1,6 @@
 #!/bin/sh
-# Put this image's skills back over the agent's home copy, every boot.
+# Put this image's skills back over the agent's home copy: every boot (as root,
+# before the agent runs) and after each update (as the agent, see ritmo_update.py).
 #
 # Hermes syncs bundled skills into the home but skips any it thinks the owner
 # customised, by comparing a hash per directory. The home is writable by the
@@ -7,11 +8,17 @@
 # good: no fix from this image would reach it again, silently. Here the image
 # is the source of truth, and the manifest line is dropped so the next sync
 # records the right hash.
+#
+# The home belongs to the agent, so nothing here runs as root on a path the agent
+# could have swapped for a symlink: the copy is a fresh directory, and the manifest
+# is edited as the agent. The scripts the agent runs live in /opt, root-owned.
 set -eu
 
 BUNDLED=/opt/hermes/skills
 HOME_SKILLS=/var/lib/hermes/skills
 MANIFEST="$HOME_SKILLS/.bundled_manifest"
+AS_AGENT=""
+[ "$(id -u)" = 0 ] && AS_AGENT="/command/s6-setuidgid hermes"
 
 [ -d "$HOME_SKILLS" ] || exit 0
 
@@ -19,17 +26,21 @@ for name in $(cat /opt/ritmo/skills.list 2>/dev/null); do
   source="$BUNDLED/$name"
   target="$HOME_SKILLS/$name"
   [ -d "$source" ] || continue
-  if ! { [ -d "$target" ] && diff -rq "$source" "$target" >/dev/null 2>&1; }; then
-    echo "[ritmo] restoring skill $name from the image"
-    rm -rf "$target"
-    cp -a "$source" "$target"
-    if [ -f "$MANIFEST" ]; then
-      grep -v "^$name:" "$MANIFEST" > "$MANIFEST.new" 2>/dev/null || true
-      mv "$MANIFEST.new" "$MANIFEST"
-      chown hermes:hermes "$MANIFEST"
-    fi
+  if [ -d "$target" ] && [ ! -L "$target" ] && diff -rq "$source" "$target" >/dev/null 2>&1; then
+    continue
   fi
-  # Root-owned and read-only: the agent reads its skills but can never patch them.
-  chown -R root:root "$target"
-  chmod -R a-w "$target"
+  echo "[ritmo] restoring skill $name from the image"
+  # As the agent: a copy it owns, put in place by a rename inside its own home.
+  $AS_AGENT sh -c '
+    set -eu
+    rm -rf "$2.ritmo-new"
+    cp -R "$1" "$2.ritmo-new"
+    rm -rf "$2"
+    mv "$2.ritmo-new" "$2"
+    if [ -f "$3" ] && [ ! -L "$3" ]; then
+      rm -f "$3.ritmo-new"
+      grep -v "^$4:" "$3" > "$3.ritmo-new" 2>/dev/null || true
+      mv "$3.ritmo-new" "$3"
+    fi
+  ' sh "$source" "$target" "$MANIFEST" "$name"
 done

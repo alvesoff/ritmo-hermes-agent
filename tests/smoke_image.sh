@@ -90,4 +90,25 @@ echo "$gate" | grep -q '"routine":"morning"' || fail "routine gate did not wake 
 quiet=$($AS_AGENT RITMO_NOW=2026-10-19T07:31:00-03:00 $PY /tmp/rh/scripts/ritmo_rotinas.py | tail -1)
 [ "$quiet" = '{"wakeAgent": false}' ] || fail "routine gate woke twice: $quiet"
 
+echo "== restore reads the owner's message from Hermes' own store"
+code=$($AS_AGENT python3 /opt/hermes/skills/ritmo/scripts/ritmo.py export | $PY -c 'import json, sys; print(json.load(sys.stdin)["code"])')
+$AS_AGENT RITMO_CODE="$code" $PY - <<'PY' || fail "Hermes' SessionDB did not take the test messages"
+import os, sys
+sys.path.insert(0, "/opt/hermes")
+from hermes_state import SessionDB
+code = os.environ["RITMO_CODE"]
+db = SessionDB()
+db.create_session("s-smoke", "plow_chat", chat_id="cht_smoke", chat_type="dm")
+db.create_session("s-stranger", "plow_chat", chat_id="cht_stranger", chat_type="dm")
+db.append_message("s-smoke", "user", content="[Cron delivery: ritmo-lembretes]\n" + code)
+db.append_message("s-smoke", "user", content=[{"type": "text", "text": "Guarde:\n" + code[:60] + "\n" + code[60:]}])
+db.append_message("s-stranger", "user", content="RITMO-BACKUP-1:AAAA.")
+db.close()
+print("stored")
+PY
+restored=$($AS_AGENT HERMES_SESSION_ID=s-smoke HERMES_SESSION_CHAT_ID=cht_smoke HERMES_SESSION_CHAT_TYPE=dm \
+  PLOW_HOME_CHANNEL=cht_smoke python3 /opt/hermes/skills/ritmo/scripts/ritmo.py import --from-chat) \
+  || fail "import --from-chat failed against Hermes' real state.db: $restored"
+echo "$restored" | grep -q '"timezone": "America/Sao_Paulo"' || fail "import --from-chat restored something else: $restored"
+
 echo "SMOKE OK"

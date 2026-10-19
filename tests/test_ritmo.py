@@ -448,6 +448,108 @@ class Backup(Home):
         self.assertNotIn("future_feature", core.read_json("config.json", {}))
 
 
+class RestoreFromChat(Home):
+    """`import --from-chat` reads the owner's message from Hermes' state.db, never a retyped copy."""
+
+    SESSIONS = [("s-owner", "cht_owner", "dm"), ("s-owner-before", "cht_owner", "dm"),
+                ("s-other", "cht_other", "dm"), ("s-group", "cht_group", "group")]
+
+    def setUp(self):
+        super().setUp()
+        names = ("HERMES_SESSION_ID", "HERMES_SESSION_CHAT_ID", "HERMES_SESSION_CHAT_TYPE", "PLOW_HOME_CHANNEL")
+        saved = {name: os.environ.get(name) for name in names}
+        self.addCleanup(lambda: [os.environ.pop(n, None) if v is None else os.environ.__setitem__(n, v)
+                                 for n, v in saved.items()])
+        self.in_chat("s-owner", "cht_owner", "dm")
+        os.environ["PLOW_HOME_CHANNEL"] = "cht_owner"
+        self.configure(name="Ana", wake="05:20")
+        self.mine = self.cli("export")[1]["code"]
+        self.configure(name="Intruso", wake="09:00")
+        self.theirs = self.cli("export")[1]["code"]
+        shutil.rmtree(os.path.join(self.home, "ritmo"))
+
+    def in_chat(self, session, chat, chat_type):
+        os.environ.update(HERMES_SESSION_ID=session, HERMES_SESSION_CHAT_ID=chat, HERMES_SESSION_CHAT_TYPE=chat_type)
+
+    def chat_store(self, *messages):
+        """Hermes' own tables, holding `(session, content, minutes_ago)` user messages."""
+        import sqlite3
+        import time
+        connection = sqlite3.connect(os.path.join(self.home, "state.db"))
+        connection.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT NOT NULL, chat_id TEXT, chat_type TEXT)")
+        connection.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, "
+                           "role TEXT NOT NULL, content TEXT, timestamp REAL NOT NULL, api_content TEXT)")
+        connection.executemany("INSERT INTO sessions VALUES (?, 'plow_chat', ?, ?)", self.SESSIONS)
+        for session, content, minutes_ago in messages:
+            connection.execute("INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, 'user', ?, ?)",
+                               (session, content, time.time() - minutes_ago * 60))
+        connection.commit()
+        connection.close()
+
+    def restore(self):
+        return self.cli("import", "--from-chat")
+
+    def test_only_the_owners_own_message_is_read(self):
+        self.chat_store(
+            ("s-owner", "Guarde:\n" + self.mine[:50] + "\n" + self.mine[50:] + "\nvaleu", 3),
+            ("s-other", self.theirs, 1),
+            ("s-group", self.theirs, 1),
+            ("s-owner", "[Cron delivery: ritmo-lembretes]\n" + self.theirs, 0.5),
+        )
+        code, restored = self.restore()
+        self.assertEqual(code, 0, restored)
+        self.assertEqual(restored["restored"]["name"], "Ana",
+                         "another person's chat, a group and Ritmo's own mirrored export are never read")
+        self.assertEqual(core.load_config()["wake"], "05:20")
+
+    def test_a_chat_that_moved_to_a_new_session_still_counts(self):
+        self.chat_store(("s-owner-before", self.mine, 2))
+        code, restored = self.restore()
+        self.assertEqual(code, 0, restored)
+
+    def test_a_damaged_newest_code_is_reported_not_swapped_for_an_older_one(self):
+        self.chat_store(("s-owner", self.theirs, 20), ("s-owner", self.mine[:-30] + ".", 1))
+        code, result = self.restore()
+        self.assertEqual(code, 1)
+        self.assertIn("damaged", result["error"])
+        self.assertFalse(os.path.exists(core.path("config.json")))
+
+    def test_codes_arrive_inside_parts_or_after_a_mirrored_reminder(self):
+        parts = "\x00json:" + json.dumps([{"type": "text", "text": "Guarde:\n" + self.mine[:60] + "\n" + self.mine[60:]},
+                                           {"type": "image_url", "image_url": {"url": "x"}}])
+        self.chat_store(("s-owner", parts, 1))
+        code, restored = self.restore()
+        self.assertEqual(code, 0, restored)
+        os.remove(os.path.join(self.home, "state.db"))
+        merged = "[Cron delivery: ritmo-lembretes]\n⏰ Beber água\n\n" + self.mine
+        self.chat_store(("s-owner", merged, 1))
+        code, restored = self.restore()
+        self.assertEqual(code, 0, restored)
+
+    def test_refused_outside_the_owners_one_to_one_chat(self):
+        self.chat_store(("s-group", self.mine, 1), ("s-other", self.mine, 1))
+        for session, chat, chat_type in (("s-group", "cht_group", "group"), ("s-other", "cht_other", "dm")):
+            self.in_chat(session, chat, chat_type)
+            code, result = self.restore()
+            self.assertEqual(code, 1, chat)
+            self.assertIn("only from the owner", result["error"])
+        for name in ("HERMES_SESSION_ID", "HERMES_SESSION_CHAT_ID"):
+            os.environ.pop(name)
+        code, result = self.restore()
+        self.assertIn("only while answering", result["error"])
+
+    def test_nothing_to_read_asks_again_and_a_code_with_the_flag_is_ambiguous(self):
+        code, result = self.restore()
+        self.assertIn("missing", result["error"])
+        self.chat_store(("s-owner", "oi", 1))
+        code, result = self.restore()
+        self.assertEqual(code, 1)
+        self.assertIn("forward it again", result["error"])
+        code, result = self.cli("import", "--from-chat", self.mine)
+        self.assertIn("not both", result["error"])
+        self.assertFalse(os.path.exists(core.path("config.json")))
+
+
 class Setup(Home):
     def test_config_show_says_what_setup_still_needs(self):
         code, shown = self.cli("config", "show")

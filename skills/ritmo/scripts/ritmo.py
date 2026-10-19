@@ -19,7 +19,8 @@ wall clock; the agent never converts zones itself.
   ritmo.py move <id> --at 'YYYY-MM-DD HH:MM'
   ritmo.py remove <id>
   ritmo.py plan <YYYY-MM-DD> '<json list of {"text","time","minutes"}>'
-  ritmo.py export | import '<RITMO-BACKUP-1:...>'
+  ritmo.py export [--send]
+  ritmo.py import --from-chat | import '<RITMO-BACKUP-1:...>'
   ritmo.py doctor
 """
 
@@ -392,9 +393,102 @@ def decode_backup(text: str) -> dict:
     return payload
 
 
+# Hermes stores a multimodal turn (text plus an attachment) as this prefix and a JSON list of parts.
+CONTENT_JSON_PREFIX = "\x00json:"
+# A delivery Hermes mirrors into the chat (`cron.mirror_delivery`) is a user turn under this header.
+MIRROR_HEADER = re.compile(r"\[Cron delivery: [^\]\n]*\]\n")
+
+
+def message_text(content) -> str:
+    """The words of one stored message, whether Hermes kept it as plain text or as parts."""
+    text = str(content or "")
+    if not text.startswith(CONTENT_JSON_PREFIX):
+        return text
+    try:
+        parts = json.loads(text[len(CONTENT_JSON_PREFIX):])
+    except ValueError:
+        return text
+    if isinstance(parts, str):
+        return parts
+    if isinstance(parts, dict):
+        parts = [parts]
+    return "\n".join(part if isinstance(part, str) else str(part.get("text") or "")
+                     for part in parts if isinstance(part, (str, dict)))
+
+
+def owner_words(text: str) -> str:
+    """Drop what Ritmo itself delivered, so its own `export --send` is never read back as the owner's."""
+    if not text.startswith("[Cron delivery: "):
+        return text
+    # A mirrored delivery is one segment; anything after a blank line was written by the owner.
+    body = MIRROR_HEADER.sub("", text, count=1)
+    return body.split("\n\n", 1)[1] if "\n\n" in body else ""
+
+
+def backup_from_chat() -> dict:
+    """The backup code in the owner's newest message that holds one, read as it arrived.
+
+    Copying 600 random characters into a command is where a restore broke in a real test: one
+    wrong character and the whole routine is lost. Read from Hermes' state.db, the code is never
+    retyped. Only the chat this command runs in is read, and only when it is the owner's
+    one-to-one chat: Hermes hands every command its session and chat, and Plow names the owner's
+    chat in PLOW_HOME_CHANNEL. Only the newest message with a code counts: when it is damaged the
+    owner hears so, instead of an older backup coming back in its place.
+    """
+    import pathlib
+    import sqlite3
+    session = os.environ.get("HERMES_SESSION_ID", "")
+    chat = os.environ.get("HERMES_SESSION_CHAT_ID", "")
+    home_chat = os.environ.get("PLOW_HOME_CHANNEL", "")
+    if not (session or chat):
+        raise RitmoError("restore runs only while answering the owner's message in their own chat")
+    if os.environ.get("HERMES_SESSION_CHAT_TYPE", "dm") != "dm" or (home_chat and chat and chat != home_chat):
+        raise RitmoError("a backup is restored only from the owner's one-to-one chat; ignore this one")
+    database = pathlib.Path(core.home(), "state.db")
+    if not database.exists():
+        raise RitmoError("the conversation store is missing; tell the owner the restore failed and to "
+                         "try again later. Never retype the code")
+    rows = None
+    for attempt in range(3):
+        try:
+            connection = sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=10)
+            try:
+                # Session and chat both: a long chat may have moved to a new session since. Compared
+                # as bytes: LIKE stops at the NUL that starts a stored list of parts.
+                rows = connection.execute(
+                    """SELECT m.content FROM messages m JOIN sessions s ON s.id = m.session_id
+                       WHERE m.role = 'user' AND instr(CAST(m.content AS BLOB), CAST('RITMO-BACKUP-1:' AS BLOB)) > 0
+                         AND (m.session_id = ? OR (? != '' AND s.chat_id = ? AND s.chat_type = 'dm'))
+                       ORDER BY m.timestamp DESC, m.id DESC LIMIT 20""", (session, chat, chat)).fetchall()
+            finally:
+                connection.close()
+            break
+        except sqlite3.OperationalError as error:
+            # A reader can catch the writer mid-checkpoint for a moment ("disk I/O error").
+            if attempt == 2:
+                raise RitmoError(f"could not read the conversation store ({error}); tell the owner the "
+                                 "restore failed and to try again in a minute. Never retype the code") from error
+            import time
+            time.sleep(0.2)
+    for (content,) in rows or []:
+        words = owner_words(message_text(content))
+        if BACKUP_PREFIX in words:
+            # The last code in the message: anything before it is quoted or older.
+            codes = [m.group(0) for m in BACKUP_PATTERN.finditer(words)]
+            return decode_backup(codes[-1] if codes else words)
+    raise RitmoError("no backup message from the owner in this chat; ask them to forward it again")
+
+
 def cmd_import(args):
     """Restore an exported setup. Everything is checked first; nothing is written on a refusal."""
-    payload = decode_backup(args.code)
+    if args.from_chat and args.code:
+        raise RitmoError("give either --from-chat or a code, not both; --from-chat is the safe one")
+    if args.from_chat:
+        payload = backup_from_chat()
+    elif args.code:
+        payload = decode_backup(args.code)
+    else:
+        raise RitmoError("use `import --from-chat` (reads the owner's message as it arrived)")
     # Keys a newer Ritmo knows and this one does not are left behind.
     settings = {key: value for key, value in payload["config"].items() if key in core.DEFAULT_CONFIG}
     config = core.validate_config(settings)
@@ -537,7 +631,8 @@ def parser() -> argparse.ArgumentParser:
     export = sub.add_parser("export")
     export.add_argument("--send", action="store_true", help="deliver the code to the owner verbatim, no copying")
     restore = sub.add_parser("import")
-    restore.add_argument("code")
+    restore.add_argument("code", nargs="?")
+    restore.add_argument("--from-chat", action="store_true", help="read the code from the owner's message as it arrived")
     return root
 
 

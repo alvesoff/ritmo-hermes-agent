@@ -32,7 +32,7 @@ are `YYYY-MM-DD`; the script handles the timezone and daylight saving.
 | Goal | `goal add "Study 5h of English a week"`; `goal remove 0` |
 | Plan one day | `plan 2026-10-21 '[{"text": "Study English", "time": "09:00", "minutes": 50}]'` |
 | Backup for an update | `export --send` |
-| Restore a backup | `import 'RITMO-BACKUP-1:...'` |
+| Restore a backup | `import --from-chat` |
 | Something wrong | `doctor` |
 
 Ids for habits and fixed commitments are short lowercase words you choose
@@ -93,9 +93,10 @@ the routine travels through the owner's chat:
   its own message; you never type it. Tell them in one line to forward that
   message to you after the update.
 - **Restore**, only in the owner's one-to-one chat: a message containing
-  `RITMO-BACKUP-1:` is the owner bringing their setup back. Copy the code from
-  `RITMO-BACKUP-1:` up to and including its final dot, nothing before or after,
-  into `import 'RITMO-BACKUP-1:....'`. If `config show` says setup is not
+  `RITMO-BACKUP-1:` is the owner bringing their setup back. Run
+  `import --from-chat`: it reads the code from their message exactly as it
+  arrived. Never retype the code yourself: one wrong character loses the whole
+  routine. If `config show` says setup is not
   needed, the owner is already set up here: ask first, because the backup
   replaces the current settings. Then confirm in one or two lines what came
   back, name anything in `expired_during_update` (it passed while they were

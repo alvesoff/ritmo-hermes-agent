@@ -15,6 +15,7 @@ Standard library only.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import copy
 import datetime as dt
@@ -54,7 +55,9 @@ DEFAULT_TEAM: dict = {
     "review_model": "anthropic/claude-sonnet-5",
     "paused_until": "",
 }
-REPO_DEFAULTS = {"dev": "develop", "prod": "main", "promote": "now", "auto_merge": True, "allow_no_ci": False}
+REPO_DEFAULTS = {"dev": "develop", "prod": "main", "promote": "now", "auto_merge": True, "allow_no_ci": False,
+                 "scope": ""}   # what the owner told about the project, read before writing its demands
+SCOPE_MAX = 4000
 LEVELS = ("junior", "mid", "senior")
 _REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
@@ -182,6 +185,8 @@ def validate_team(team: dict) -> dict:
         for flag in ("auto_merge", "allow_no_ci"):
             if not isinstance(repo[flag], bool):
                 raise EquipeError(f"{flag} must be true or false")
+        if not isinstance(repo["scope"], str) or len(repo["scope"]) > SCOPE_MAX:
+            raise EquipeError(f"scope is the project's description in up to {SCOPE_MAX} characters")
         if not repo["dev"] or not repo["prod"]:
             raise EquipeError("dev and prod are branch names; with a single branch, give the same name to both")
         repos.append(repo)
@@ -247,7 +252,12 @@ def person_for(team: dict, login: str) -> dict | None:
 
 
 def repo_for(team: dict, name: str) -> dict:
-    repo = next((r for r in team["repos"] if r["repo"].lower() == name.lower()), None)
+    """By owner/name, or by name alone when only one team repository has it."""
+    name = name.strip().lower()
+    repo = next((r for r in team["repos"] if r["repo"].lower() == name), None)
+    if repo is None and "/" not in name:
+        matches = [r for r in team["repos"] if r["repo"].lower().split("/", 1)[1] == name]
+        repo = matches[0] if len(matches) == 1 else None
     if repo is None:
         raise EquipeError(f"{name} is not one of the team's repositories; add it with `team repo add`")
     return repo
@@ -392,6 +402,17 @@ class GitHub:
             raise EquipeError(f"GitHub {method} {route} answered {status}: {message}")
         return data
 
+    def text_file(self, repo: str, path: str, limit: int = 6000) -> str:
+        """A text file of the default branch, or "" when it does not exist."""
+        status, data, _ = self.request("GET", f"{GITHUB_API}/repos/{repo}/contents/{urllib.parse.quote(path)}",
+                                       token=self.token)
+        if status == 404 or not isinstance(data, dict) or data.get("type") != "file":
+            return ""
+        if status != 200:
+            raise EquipeError(f"GitHub GET {path} answered {status}")
+        text = base64.b64decode(data.get("content") or "").decode("utf-8", "replace")
+        return text if len(text) <= limit else text[:limit] + "\n[...]"
+
     def pages(self, route: str, limit: int = 300) -> list:
         items, page = [], 1
         joiner = "&" if "?" in route else "?"
@@ -530,12 +551,20 @@ class RitmoBoard:
         created = self.call("POST", "/api/ritmo/v1/demandas", {
             "person": demand.get("person"), "title": demand["title"], "description": demand["description"],
             "githubUrl": demand.get("githubUrl"), "priority": demand.get("priority", "normal"),
-            "dueDate": demand.get("dueDate"), "steps": demand.get("steps", [])})
+            "dueDate": demand.get("dueDate"), "steps": demand.get("steps", []),
+            **({"projectId": demand["projectId"]} if demand.get("projectId") else {})})
         return {"id": str(created["id"]), "url": created["url"], **({"incomplete": created["incompleta"]}
                                                                  if created.get("incompleta") else {})}
 
     def comment(self, ref: str, text: str) -> None:
         self.call("POST", f"/api/ritmo/v1/demandas/{int(ref)}/comentarios", {"text": text})
+
+    def projects(self, person: str) -> list[dict]:
+        query = urllib.parse.urlencode({"pessoa": person})
+        return self.call("GET", f"/api/ritmo/v1/projetos?{query}").get("projetos", [])
+
+    def create_project(self, person: str, name: str) -> dict:
+        return self.call("POST", "/api/ritmo/v1/projetos", {"person": person, "name": name})
 
 
 def board_connect_start(url: str, request: Requester = http) -> dict:

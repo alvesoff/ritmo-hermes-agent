@@ -555,5 +555,120 @@ class Gate(Home):
         self.assertEqual(equipe_gate.gate(), equipe_gate.SILENT)
 
 
+class FakeBoard:
+    """The board API OpenSeed's painel serves, in memory."""
+
+    def __init__(self):
+        self.calls, self.demands, self.projects = [], [], []
+
+    def __call__(self, method, url, token="", body=None, form=None, accept="", timeout=30):
+        self.calls.append((method, url, body))
+        path = url.replace("https://painel.example.com", "")
+        if method == "POST" and path == "/api/ritmo/v1/demandas":
+            demand = {"id": len(self.demands) + 1, **body, "status": "todo"}
+            self.demands.append(demand)
+            return 201, {"id": demand["id"], "url": f"https://painel.example.com/tarefas?t={demand['id']}"}, {}
+        if method == "GET" and path.startswith("/api/ritmo/v1/demandas?"):
+            return 200, {"demandas": [dict(d, githubUrl=d.get("githubUrl")) for d in self.demands]}, {}
+        if method == "GET" and re.match(r"/api/ritmo/v1/demandas/\d+$", path):
+            d = self.demands[int(path.rsplit("/", 1)[1]) - 1]
+            return 200, {**d, "url": f"https://painel.example.com/tarefas?t={d['id']}", "person": {"email": d["person"]}}, {}
+        if method == "GET" and path.startswith("/api/ritmo/v1/projetos?"):
+            return 200, {"projetos": self.projects}, {}
+        if method == "POST" and path == "/api/ritmo/v1/projetos":
+            project = {"id": 10 + len(self.projects), "name": body["name"], "status": "open"}
+            self.projects.append(project)
+            return 201, project, {}
+        raise AssertionError(f"unexpected board call {method} {url}")
+
+
+class OwnerDemands(Home):
+    """The owner describes the work in chat; Ritmo writes it on the board, tied to the repository."""
+
+    def setUp(self):
+        super().setUp()
+        self.team = core.validate_team({
+            "enabled": True, "board": {"type": "ritmo", "url": "https://painel.example.com"},
+            "repos": [{"repo": REPO, "scope": "Calculadora para a escola"}],
+            "people": [{"name": "Ana", "github": "ana", "level": "junior", "board_person": "ana@example.com"}],
+            "rules": ["back-end antes do front-end"]})
+        core.save_team(self.team)
+        core.write_json("board.json", {"url": "https://painel.example.com", "token": "tok"}, private=True)
+        core.write_json("github.json", {"access_token": "t"}, private=True)
+        self.board = FakeBoard()
+        self.saved_board_for, self.saved_gh = core.board_for, equipe.gh
+        core.board_for = lambda team, github, repo, request=None: core.RitmoBoard("https://painel.example.com", "tok", self.board)
+        equipe.gh = lambda: core.GitHub("t", self.docs)
+        self.files = {"README.md": "# App\nUma calculadora."}
+
+    def tearDown(self):
+        core.board_for, equipe.gh = self.saved_board_for, self.saved_gh
+        super().tearDown()
+
+    def docs(self, method, url, token="", body=None, form=None, accept="", timeout=30):
+        name = url.split("/contents/", 1)[1]
+        if name in self.files:
+            import base64
+            return 200, {"type": "file", "content": base64.b64encode(self.files[name].encode()).decode()}, {}
+        return 404, {"message": "Not Found"}, {}
+
+    def test_a_demand_is_created_for_the_person_and_tied_to_the_repository(self):
+        steps = json.dumps([{"title": "Back-end: subtract", "location": "calc.py"}, {"title": "Tela"}])
+        code, result = self.cli("demand", "create", "app", "--person", "ana", "--title", "Subtração",
+                                "--description", "Cole no Claude: ...", "--steps", steps, "--priority", "alta")
+        self.assertEqual(code, 0, result)
+        sent = self.board.demands[0]
+        self.assertEqual((sent["person"], sent["githubUrl"], sent["priority"]), ("ana@example.com", f"https://github.com/{REPO}", "alta"))
+        self.assertEqual(len(sent["steps"]), 2)
+        self.assertTrue(result["created"]["url"].endswith("?t=1"))
+
+    def test_the_pr_that_delivers_it_is_found_without_citing_it(self):
+        self.cli("demand", "create", REPO, "--person", "ana", "--title", "Subtração", "--description", "x")
+        pr = dict(FakeGitHub().pr, body="sem referência", title="Subtração")
+        demand, how = equipe.find_demand(self.team, None, REPO, pr, core.load_state())
+        self.assertEqual((demand["id"], how), ("1", "github link"))
+        self.cli("demand", "create", REPO, "--person", "ana", "--title", "Divisão", "--description", "y")
+        demand, candidates = equipe.find_demand(self.team, None, REPO, pr, core.load_state())
+        self.assertIsNone(demand)
+        self.assertEqual([c["title"] for c in candidates], ["Subtração", "Divisão"], "two open: Ritmo picks or asks")
+
+    def test_refusals_change_nothing(self):
+        for argv, why in ((["--person", "bia"], "not on the team"), (["--person", "ana", "--due", "amanhã"], "YYYY-MM-DD"),
+                          (["--person", "ana", "--steps", "[{\"title\": \"\"}]"], "JSON list")):
+            code, result = self.cli("demand", "create", REPO, "--title", "x", "--description", "y", *argv)
+            self.assertEqual(code, 1)
+            self.assertIn(why, result["error"])
+        code, result = self.cli("demand", "create", "outro", "--person", "ana", "--title", "x", "--description", "y")
+        self.assertIn("not one of the team's repositories", result["error"])
+        self.assertEqual(self.board.demands, [])
+
+    def test_projects_are_listed_and_created_once(self):
+        code, made = self.cli("project", "create", "--person", "ana", "--name", "Calculadora")
+        self.assertTrue(made["created"])
+        code, again = self.cli("project", "create", "--person", "ana", "--name", "calculadora ")
+        self.assertFalse(again["created"], "the same name is the same project")
+        code, listed = self.cli("project", "list", "--person", "ana")
+        self.assertEqual([p["name"] for p in listed["projects"]], ["Calculadora"])
+        self.cli("demand", "create", REPO, "--person", "ana", "--title", "x", "--description", "y", "--project", str(made["project"]["id"]))
+        self.assertEqual(self.board.demands[0]["projectId"], made["project"]["id"])
+
+    def test_context_brings_the_scope_the_docs_and_what_is_open(self):
+        self.cli("demand", "create", REPO, "--person", "ana", "--title", "Subtração", "--description", "x")
+        code, context = self.cli("context", "app")
+        self.assertEqual(code, 0, context)
+        self.assertEqual(context["scope"], "Calculadora para a escola")
+        self.assertEqual(list(context["docs"]), ["README.md"])
+        self.assertEqual(context["rules"], ["back-end antes do front-end"])
+        self.assertEqual(context["open_demands"][0]["title"], "Subtração")
+
+    def test_the_owner_sets_the_scope_without_touching_the_branches(self):
+        code, result = self.cli("team", "repo", "add", REPO, "--scope", "Sistema de reboque para a RJ Towing")
+        self.assertEqual(code, 0, result)
+        repo = core.load_team()["repos"][0]
+        self.assertEqual((repo["scope"], repo["dev"], repo["prod"]), ("Sistema de reboque para a RJ Towing", "develop", "main"))
+        with self.assertRaises(core.EquipeError):
+            core.validate_team({"repos": [{"repo": REPO, "scope": "x" * 5000}]})
+
+
 if __name__ == "__main__":
     unittest.main()

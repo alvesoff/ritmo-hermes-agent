@@ -462,7 +462,7 @@ def backup_from_chat() -> dict:
                 # as bytes: LIKE stops at the NUL that starts a stored list of parts.
                 rows = connection.execute(
                     """SELECT m.content FROM messages m JOIN sessions s ON s.id = m.session_id
-                       WHERE m.role = 'user' AND instr(CAST(m.content AS BLOB), CAST('RITMO-BACKUP-1:' AS BLOB)) > 0
+                       WHERE m.role = 'user' AND instr(CAST(m.content AS BLOB), CAST('BACKUP' AS BLOB)) > 0
                          AND (m.session_id = ? OR (? != '' AND s.chat_id = ? AND s.chat_type = 'dm'))
                        ORDER BY m.timestamp DESC, m.id DESC LIMIT 20""", (session, chat, chat)).fetchall()
             finally:

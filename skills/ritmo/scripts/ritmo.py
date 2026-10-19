@@ -347,6 +347,11 @@ def backup_code(config: dict, agenda: dict) -> tuple[str, int]:
     ]
     payload = {"exported": core.now_in(config).isoformat(timespec="minutes") if core.configured(config) else "",
                "config": config, "items": items}
+    # The Team module's settings travel too (people, repositories, rules); its connections never do:
+    # GitHub and the board are connected again by code after an update.
+    team = core.read_json("equipe.json", {})
+    if team:
+        payload["team"] = team
     packed = zlib.compress(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(), 9)
     return BACKUP_PREFIX + base64.urlsafe_b64encode(packed).decode().rstrip("=") + ".", len(items)
 
@@ -429,11 +434,15 @@ def cmd_import(args):
         core.write_json("agenda.json", agenda)
         old_zone = previous.get("timezone") if isinstance(previous.get("timezone"), str) else ""
         config = core.save_config(settings)
+        if isinstance(payload.get("team"), dict):
+            core.write_json("equipe.json", payload["team"])
         # Items the new agent already had follow the restored zone, like any zone change.
         core.change_timezone(old_zone, config["timezone"])
     out({"restored": {"name": config["name"], "timezone": config["timezone"], "tone": config["tone"],
                       "habits": len(config["habits"]), "fixed": len(config["fixed"]), "goals": len(config["goals"]),
-                      "items_added": len(added)},
+                      "items_added": len(added), "team": isinstance(payload.get("team"), dict)},
+         **({"reconnect": "the team settings came back; connect GitHub and the board again (equipe skill)"}
+            if isinstance(payload.get("team"), dict) else {}),
          "replaced_settings": bool(previous),
          "expired_during_update": expired,
          "backup_made": payload.get("exported", "")})

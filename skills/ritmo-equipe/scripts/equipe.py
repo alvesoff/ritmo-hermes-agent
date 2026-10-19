@@ -17,6 +17,8 @@ Every command prints JSON; a refusal prints {"error": ...} and exits 1.
   equipe.py followup <owner/name> <number> --title T --description D [--steps '<json>'] [--approved]
   equipe.py link <owner/name> <number> <demand-id>
   equipe.py demand create <repo> --person LOGIN --title T --description D [--steps '<json>'] [--priority P] [--due DATE] [--project ID]
+  equipe.py demand list [--person LOGIN] [--repo R] | demand show <id> | demand delete <id>
+  equipe.py demand update <id> [--due DATE|none] [--start DATE|none] [--title T] [--priority P] [--project ID] [--status S] [--reason R] [--description D]
   equipe.py project list --person LOGIN | project create --person LOGIN --name NAME
   equipe.py context <repo>                                          (scope, docs, rules and open demands)
   equipe.py merge <owner/name> <number> --sha SHA --owner-ok        (only when the owner said so in chat)
@@ -45,6 +47,9 @@ HANDOUT_GUARD = dt.timedelta(minutes=15)
 
 def out(payload: object) -> None:
     print(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+PRIORITIES = ["baixa", "normal", "alta", "urgente"]
 
 
 def gh() -> core.GitHub:
@@ -444,7 +449,21 @@ def person_ref(team: dict, login: str) -> str:
     return person["board_person"]
 
 
+DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
 def cmd_demand(args):
+    {"create": demand_create, "list": demand_list, "show": demand_show,
+     "update": demand_update, "delete": demand_delete}[args.action](args)
+
+
+def ritmo_board(team: dict):
+    if team["board"]["type"] != "ritmo":
+        raise EquipeError("this needs a connected board (`board connect <url>`); on GitHub Issues, change the issue there")
+    return core.board_for(team, None, "")
+
+
+def demand_create(args):
     """A new demand the owner asked for. It names the repository, so the PR that delivers it is found by itself."""
     team = core.load_team()
     repo = core.repo_for(team, args.repo)
@@ -454,7 +473,7 @@ def cmd_demand(args):
         raise EquipeError(f"--steps takes a JSON list of {{\"title\", \"location\"}}: {error}") from error
     if not isinstance(steps, list) or not all(isinstance(s, dict) and str(s.get("title", "")).strip() for s in steps):
         raise EquipeError("--steps is a JSON list of {\"title\", \"location\"}")
-    if args.due and not re.match(r"^\d{4}-\d{2}-\d{2}$", args.due):
+    if args.due and not DATE.match(args.due):
         raise EquipeError("--due is a date, YYYY-MM-DD")
     if args.project and team["board"]["type"] == "github":
         raise EquipeError("projects exist only on a connected board; GitHub Issues has none")
@@ -466,11 +485,74 @@ def cmd_demand(args):
     out({"created": created, "published": True})
 
 
+def demand_list(args):
+    """Open demands, of one person and/or one repository."""
+    team = core.load_team()
+    board = ritmo_board(team)
+    github = f"https://github.com/{core.repo_for(team, args.repo)['repo']}".lower() if args.repo else ""
+    person = person_ref(team, args.person) if args.person else ""
+    found = board.open_demands(github=github, person=person)
+    if github:
+        # The board matches a prefix: owner/app would also bring owner/app-admin.
+        found = [d for d in found if (d.get("githubUrl") or "").lower().rstrip("/") == github
+                 or (d.get("githubUrl") or "").lower().startswith(github + "/")]
+    out({"demands": [{k: d.get(k) for k in ("id", "title", "status", "person", "priority", "dueDate", "url")}
+                     for d in found]})
+
+
+def demand_show(args):
+    out({"demand": ritmo_board(core.load_team()).get_any(args.id)})
+
+
+def demand_update(args):
+    """Change what the owner asked to change, nothing else. Dates: YYYY-MM-DD, or `none` to clear."""
+    team = core.load_team()
+    board = ritmo_board(team)
+    changes = {}
+    for flag, field in (("due", "dueDate"), ("start", "startDate")):
+        value = getattr(args, flag)
+        if value is not None:
+            if value.strip().lower() == "none":
+                changes[field] = None
+            elif DATE.match(value):
+                changes[field] = value
+            else:
+                raise EquipeError(f"--{flag} is a date, YYYY-MM-DD, or none to clear it")
+    for flag in ("title", "description", "reason"):
+        if getattr(args, flag) is not None and not getattr(args, flag).strip():
+            raise EquipeError(f"--{flag} is empty; leave it out to keep what is there")
+    if args.reason is not None and args.status != "doing":
+        raise EquipeError("--reason goes with --status doing: it is what is missing when sending a demand back")
+    for flag, field in (("title", "title"), ("priority", "priority"), ("project", "projectId"), ("status", "status"),
+                        ("reason", "motivo"), ("description", "description")):
+        if getattr(args, flag) is not None:
+            changes[field] = getattr(args, flag)
+    if not changes:
+        raise EquipeError("say what to change: --due, --start, --title, --priority, --project, --status "
+                          "(with --reason when sending back to doing) or --description")
+    out({"updated": board.update(args.id, changes), "changed": sorted(changes)})
+
+
+def demand_delete(args):
+    board = ritmo_board(core.load_team())
+    before = board.get_any(args.id)
+    board.delete(args.id)
+    # Forget every link to it: a follow-up or an owner link pointing at a deleted demand would fail for good.
+    with core.locked():
+        state = core.load_state()
+        for name in ("followups", "asked"):
+            records = state.get(name) or {}
+            for review_key in [k for k, v in records.items()
+                               if str(v.get("id") if isinstance(v, dict) else v) == str(before["id"])
+                               or (isinstance(v, dict) and str(v.get("demand")) == str(before["id"]))]:
+                del records[review_key]
+        core.write_json("equipe_state.json", state)
+    out({"deleted": {"id": before["id"], "title": before["title"]}})
+
+
 def cmd_project(args):
     team = core.load_team()
-    if team["board"]["type"] != "ritmo":
-        raise EquipeError("projects exist only on a connected board (`board connect <url>`), not on GitHub Issues")
-    board = core.board_for(team, None, "")
+    board = ritmo_board(team)
     ref = person_ref(team, args.person)
     if args.action == "list":
         out({"projects": board.projects(ref)})
@@ -624,16 +706,31 @@ def parser() -> argparse.ArgumentParser:
     followup.add_argument("--steps")
     followup.add_argument("--approved", action="store_true", help="the owner approved this draft in chat")
 
-    demand = sub.add_parser("demand")
-    demand.add_argument("action", choices=["create"])
-    demand.add_argument("repo")
-    demand.add_argument("--person", required=True, help="their GitHub login")
-    demand.add_argument("--title", required=True)
-    demand.add_argument("--description", required=True)
-    demand.add_argument("--steps")
-    demand.add_argument("--priority", choices=["baixa", "normal", "alta", "urgente"], default="normal")
-    demand.add_argument("--due")
-    demand.add_argument("--project", type=int)
+    demand = sub.add_parser("demand").add_subparsers(dest="action", required=True)
+    create = demand.add_parser("create")
+    create.add_argument("repo")
+    create.add_argument("--person", required=True, help="their GitHub login")
+    create.add_argument("--title", required=True)
+    create.add_argument("--description", required=True)
+    create.add_argument("--steps")
+    create.add_argument("--priority", choices=PRIORITIES, default="normal")
+    create.add_argument("--due")
+    create.add_argument("--project", type=int)
+    listing = demand.add_parser("list")
+    listing.add_argument("--person", help="their GitHub login")
+    listing.add_argument("--repo")
+    demand.add_parser("show").add_argument("id", type=int)
+    update = demand.add_parser("update")
+    update.add_argument("id", type=int)
+    update.add_argument("--due")
+    update.add_argument("--start")
+    update.add_argument("--title")
+    update.add_argument("--priority", choices=PRIORITIES)
+    update.add_argument("--project", type=int)
+    update.add_argument("--status", choices=["todo", "doing", "review", "done"])
+    update.add_argument("--reason", help="what is missing, when sending it back from review to doing")
+    update.add_argument("--description")
+    demand.add_parser("delete").add_argument("id", type=int)
 
     project = sub.add_parser("project")
     project.add_argument("action", choices=["list", "create"])

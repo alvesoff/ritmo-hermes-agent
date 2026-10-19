@@ -534,7 +534,10 @@ class RitmoBoard:
             raise EquipeError("the board connection was revoked or expired; run `board connect` again")
         if status not in ok:
             message = data.get("error") if isinstance(data, dict) else data
-            raise EquipeError(f"board {method} {route} answered {status}: {message}")
+            changed = data.get("jaMudou") if isinstance(data, dict) else None
+            # Part of a change can already be saved (and the person notified): say so, so it is not sent again.
+            raise EquipeError(f"board {method} {route} answered {status}: {message}"
+                              + (f"; these fields WERE saved, do not send them again: {changed}" if changed else ""))
         return data
 
     def get(self, ref: str) -> dict:
@@ -544,6 +547,20 @@ class RitmoBoard:
         return {"id": str(d["id"]), "url": d["url"], "title": d["title"], "description": d.get("description", ""),
                 "status": d["status"], "person": d.get("person", {}).get("email"), "githubUrl": d.get("githubUrl"),
                 "steps": d.get("steps", []), "dueDate": d.get("dueDate"), "priority": d.get("priority")}
+
+    def get_any(self, ref) -> dict:
+        """One demand, whatever its status."""
+        d = self.call("GET", f"/api/ritmo/v1/demandas/{int(ref)}")
+        return {"id": str(d["id"]), "url": d["url"], "title": d["title"], "status": d["status"],
+                "priority": d.get("priority"), "dueDate": d.get("dueDate"), "startDate": d.get("startDate"),
+                "project": d.get("project"), "person": (d.get("person") or {}).get("email"),
+                "description": d.get("description", ""), "steps": d.get("steps", [])}
+
+    def update(self, ref, changes: dict) -> dict:
+        return self.call("PATCH", f"/api/ritmo/v1/demandas/{int(ref)}", changes)
+
+    def delete(self, ref) -> None:
+        self.call("DELETE", f"/api/ritmo/v1/demandas/{int(ref)}")
 
     def open_demands(self, github: str = "", person: str = "") -> list[dict]:
         query = urllib.parse.urlencode({k: v for k, v in (("github", github), ("pessoa", person)) if v})

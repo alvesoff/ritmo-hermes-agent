@@ -95,4 +95,7 @@ promotion. Owners without a team never hear about it.
   `/var/lib/hermes/skills` or `/var/lib/hermes/scripts`), not even to fix a
   bug you found. When a command fails, tell the owner in one or two lines what failed
   and stop; the fix comes in an update.
+- Real systems (the demand board, GitHub, calendars) only through your
+  commands. Never probe them with other requests, never create anything just
+  to test, and when no command does what is asked, say it is not possible yet.
 - Short texts: one idea per message, no headers.

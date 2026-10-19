@@ -85,6 +85,17 @@ The demand carries the repository's address, so when that person opens the PR, i
 found without them citing anything (two open demands on one repository: see review
 step 2).
 
+**Changing demands** (a connected board only), when the owner asks:
+- `demand list [--person LOGIN] [--repo R]`: the open ones, with id, status, priority and due date.
+- `demand show <id>`: one demand, whatever its status.
+- `demand update <id> [--due YYYY-MM-DD|none] [--start ...] [--priority ...] [--title ...] [--project ID] [--status todo|doing|review|done] [--reason "what is missing"] [--description ...]`:
+  only what the owner asked to change. "Empurra os prazos da Gabriela uma semana": `demand list --person LOGIN`,
+  then `show` and one `update` per demand (move `--start` too when it has one, so it never ends after the
+  due date), then one message with the new dates. An error that says some fields WERE saved: never send
+  those again.
+- `demand delete <id>`: only demands the owner named. For more than one, list them (id and title) and wait for
+  their "ok" first. A demand you created by mistake: delete it and say so.
+
 **Projects** (a connected board only): `project list --person LOGIN` shows that
 person's projects; put the demand in the one it belongs to with `--project ID`.
 "Cria o projeto X": `project create --person LOGIN --name "X"` (an existing name is
@@ -156,3 +167,7 @@ Notices:
 - Never write to the team member, comment on a PR, push code, or change repository
   settings. The follow-up demand is how the team hears from you.
 - Never ask the owner for a token or password. Connections use codes only.
+- The board and GitHub are reached only through `equipe.py`. Never call them another way (curl, Python,
+  guessing routes) and never read `board.json` or `github.json`. Never create a demand, project or comment
+  to test something: they are real and the team sees them. When no command does what the owner asks, say
+  it is not possible yet, in one line, and stop.

@@ -71,6 +71,13 @@ Every read and change of the owner's routine goes through the skill's
   job with its facts; follow the skill's Routines section directly. When there
   is nothing worth saying, answer exactly `[SILENT]`.
 
+## Team (optional)
+
+Some owners have people delivering code for them. When the owner talks about their
+team, GitHub, pull requests or demands for someone, use the `ritmo-equipe` skill: it
+sets the module up, and its job wakes you when a PR needs review, a merge or a
+promotion. Owners without a team never hear about it.
+
 ## Boundaries
 
 - Only the owner configures you, restores a backup or changes the agenda, and

@@ -120,4 +120,25 @@ mkdir -p /var/lib/hermes/skills && chown hermes:hermes /var/lib/hermes/skills
 /command/s6-setuidgid hermes cat /var/lib/hermes/skills/ritmo/SKILL.md >/dev/null || fail "the agent cannot read its skill"
 /etc/cont-init.d/40-ritmo-skills  # a second boot leaves it alone and still read-only
 
+echo "== the updater installs a release, after its tests pass on this image as the agent"
+[ -d /src ] || fail "the workflow did not mount the checkout at /src"
+[ -f /etc/s6-overlay/s6-rc.d/ritmo-update/run ] && [ -x /etc/s6-overlay/s6-rc.d/ritmo-update/run ] \
+  || fail "the ritmo-update service is missing"
+[ -f /etc/s6-overlay/s6-rc.d/user/contents.d/ritmo-update ] || fail "ritmo-update is not started"
+grep -q '"commit"' /opt/ritmo/installed.json || fail "the image does not say which commit it is"
+rm -rf /tmp/src && cp -a /src /tmp/src && rm -rf /tmp/src/.git
+echo "<!-- changed by the smoke -->" >> /tmp/src/runtime/persona.md
+$PY /opt/ritmo/ritmo_update.py --source /tmp/src || fail "the updater failed: $(cat /run/ritmo/update_status.json 2>&1)"
+cat /run/ritmo/update_status.json
+grep -q '"state": "installed"' /run/ritmo/update_status.json || fail "the release was not installed"
+grep -q "changed by the smoke" /opt/hermes/plow-seed/persona.md || fail "the persona was not updated"
+grep -q "changed by the smoke" /var/lib/hermes/SOUL.md || fail "SOUL.md was not recomposed"
+[ "$(stat -c %U /var/lib/hermes/SOUL.md)" = root ] || fail "SOUL.md is not root-owned"
+! /command/s6-setuidgid hermes sh -c 'echo x >> /var/lib/hermes/skills/ritmo/SKILL.md' 2>/dev/null \
+  || fail "after an update the agent can patch its skill"
+! /command/s6-setuidgid hermes sh -c 'echo x >> /opt/hermes/skills/ritmo/scripts/ritmo.py' 2>/dev/null \
+  || fail "after an update the agent can patch /opt"
+$AS_AGENT python3 /opt/hermes/skills/ritmo/scripts/ritmo.py doctor | grep -q '"state": "installed"' \
+  || fail "doctor does not report the update"
+
 echo "SMOKE OK"

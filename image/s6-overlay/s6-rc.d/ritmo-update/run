@@ -1,0 +1,4 @@
+#!/command/with-contenv sh
+# Ritmo's updater (see /opt/ritmo/ritmo_update.py): root, because what it
+# installs must stay out of the agent's reach.
+exec /opt/hermes/.venv/bin/python3 /opt/ritmo/ritmo_update.py

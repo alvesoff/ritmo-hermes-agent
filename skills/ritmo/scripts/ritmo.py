@@ -569,6 +569,13 @@ def cmd_doctor(args):
             report["recent_errors"] = handle.read()[-2000:]
     except FileNotFoundError:
         report["recent_errors"] = ""
+    # What the updater installed and last did (it runs outside the agent, as root).
+    for key, where in (("version", "/opt/ritmo/installed.json"), ("updates", "/run/ritmo/update_status.json")):
+        try:
+            with open(where, encoding="utf-8") as handle:
+                report[key] = json.load(handle)
+        except (OSError, ValueError):
+            report[key] = None
     out(report)
 
 

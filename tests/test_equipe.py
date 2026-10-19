@@ -625,12 +625,17 @@ class OwnerDemands(Home):
     def test_the_pr_that_delivers_it_is_found_without_citing_it(self):
         self.cli("demand", "create", REPO, "--person", "ana", "--title", "Subtração", "--description", "x")
         pr = dict(FakeGitHub().pr, body="sem referência", title="Subtração")
+        demand, candidates = equipe.find_demand(self.team, None, REPO, pr, core.load_state())
+        self.assertIsNone(demand, "a demand not started yet is checked against the PR before linking")
+        self.assertEqual([c["title"] for c in candidates], ["Subtração"])
+        self.board.demands[0]["status"] = "doing"
         demand, how = equipe.find_demand(self.team, None, REPO, pr, core.load_state())
-        self.assertEqual((demand["id"], how), ("1", "github link"))
+        self.assertEqual((demand["id"], how), ("1", "github link"), "the one in progress is linked by itself")
         self.cli("demand", "create", REPO, "--person", "ana", "--title", "Divisão", "--description", "y")
+        self.board.demands[1]["status"] = "doing"
         demand, candidates = equipe.find_demand(self.team, None, REPO, pr, core.load_state())
         self.assertIsNone(demand)
-        self.assertEqual([c["title"] for c in candidates], ["Subtração", "Divisão"], "two open: Ritmo picks or asks")
+        self.assertEqual([c["title"] for c in candidates], ["Subtração", "Divisão"], "two in progress: Ritmo picks or asks")
 
     def test_refusals_change_nothing(self):
         for argv, why in ((["--person", "bia"], "not on the team"), (["--person", "ana", "--due", "amanhã"], "YYYY-MM-DD"),

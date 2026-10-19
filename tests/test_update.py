@@ -93,16 +93,19 @@ class Updater(unittest.TestCase):
     def status(self) -> dict:
         return json.loads(self.read("run/ritmo/update_status.json"))
 
-    def github(self, compare="ahead", files=None):
+    def github(self, compare="ahead", files=None, on_main="ahead", compare_fails=False):
         """A fake GitHub serving one release, `v2` at commit `new`."""
         archive = tarball("acme-ritmo-new", files if files is not None else release_files())
 
         def get(url):
             self.calls.append(url)
             path = url.replace(self.updater.API, "")
+            if compare_fails and "/compare/old" in path:
+                raise self.updater.UpdateError("GitHub answered 404")
             answers = {"/repos/acme/ritmo/releases/latest": {"tag_name": "v2"},
                        "/repos/acme/ritmo/commits/v2": {"sha": "new"},
-                       "/repos/acme/ritmo/compare/old...new": {"status": compare}}
+                       "/repos/acme/ritmo/compare/old...new": {"status": compare},
+                       "/repos/acme/ritmo/compare/new...HEAD": {"status": on_main}}
             if path == "/repos/acme/ritmo/tarball/new":
                 return archive
             return json.dumps(answers[path]).encode()
@@ -124,11 +127,31 @@ class Updater(unittest.TestCase):
 
     def test_the_same_or_an_older_release_changes_nothing(self):
         for compare in ("identical", "behind", "diverged"):
+            self.updater.SETTLED.clear()
             self.github(compare=compare)
             self.updater.check_once()
-            self.assertEqual(self.status()["state"], "up_to_date", compare)
+            self.assertEqual(self.status()["state"], "skipped", compare)
             self.assertEqual(self.read("opt/hermes/skills/ritmo/SKILL.md"), "old skill")
         self.assertFalse(any("tarball" in url for url in self.calls), "nothing is downloaded")
+
+    def test_once_judged_a_release_costs_one_request_per_check(self):
+        self.github(compare="behind")
+        self.updater.check_once()
+        before = len(self.calls)
+        self.updater.check_once()
+        self.assertEqual(len(self.calls) - before, 1, "only releases/latest")
+
+    def test_a_release_off_the_default_branch_is_refused(self):
+        self.github(on_main="diverged")
+        self.updater.check_once()
+        self.assertIn("default branch", self.status()["reason"])
+        self.assertEqual(self.read("opt/hermes/skills/ritmo/SKILL.md"), "old skill")
+
+    def test_a_commit_github_does_not_know_is_reported_and_retried(self):
+        self.github(compare_fails=True)
+        self.updater.check_once()
+        self.assertIn("cannot compare", self.status()["reason"])
+        self.assertEqual(self.updater.SETTLED, {}, "a passing GitHub error is tried again next time")
 
     def test_a_release_for_another_image_waits_for_a_redeploy(self):
         self.github(files=release_files(image_api=2))
@@ -176,12 +199,24 @@ class Updater(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.root, "escape")))
         self.assertFalse(os.path.lexists(os.path.join(into, "skills/ritmo/evil")))
 
-    def test_an_image_without_a_commit_takes_the_release(self):
+    def test_an_image_without_a_commit_never_downgrades_itself(self):
         self.write("opt/ritmo/installed.json", json.dumps({"commit": "", "tag": "image"}))
         self.github()
         self.updater.check_once()
-        self.assertEqual(self.status()["state"], "installed")
-        self.assertFalse(any("compare" in url for url in self.calls))
+        self.assertEqual(self.status()["state"], "skipped")
+        self.assertIn("does not know its commit", self.status()["reason"])
+        self.assertEqual(self.read("opt/hermes/skills/ritmo/SKILL.md"), "old skill")
+
+    def test_failed_hooks_leave_it_unrecorded_so_the_next_check_retries(self):
+        hooks = os.path.join(self.root, "etc", "cont-init.d")
+        os.makedirs(hooks)
+        with open(os.path.join(hooks, "41-ritmo-refresh-persona"), "w") as handle:
+            handle.write("exit 3\n")
+        self.github()
+        self.updater.HOOKS = (os.path.join(hooks, "41-ritmo-refresh-persona"),)
+        self.updater.check_once()
+        self.assertEqual(self.status()["state"], "installed_with_problems")
+        self.assertEqual(json.loads(self.read("opt/ritmo/installed.json"))["commit"], "old")
 
 
 if __name__ == "__main__":

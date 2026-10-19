@@ -9,15 +9,19 @@ files: the skills, the persona and /opt/ritmo. The owner's data, the
 connections and Hermes itself are never touched.
 
 What makes it safe to run unattended:
-- only a published GitHub release of the repository named in update.json, and
-  only one that is AHEAD of what is installed: never a downgrade, never a fork;
+- only a published GitHub release of the repository named in update.json, on its
+  default branch (which changes through reviewed pull requests), and only one
+  AHEAD of the commit this image was built from: never a downgrade, never a fork,
+  and an image that does not know its commit (a local build) never updates;
 - only a release with this image's `image_api`: a change to the image itself
   (s6 services, cont-init, the Plow base) bumps it, and that release waits for
   a real redeploy instead of half-installing;
 - the release's own test suite runs first, as the agent user, and must pass;
-- what it installs stays root-owned and read-only to the agent.
-The owner turns it off with `auto_update: false`; RITMO_AUTO_UPDATE=off turns
-it off for the whole image.
+- /opt stays root-owned and read-only to the agent; inside the agent's own home
+  root writes nothing by name (the skills copy is refreshed as the agent).
+Trust: whoever can publish a release of that repository runs code as root on
+every agent that follows it. The owner turns it off with `auto_update: false`;
+RITMO_AUTO_UPDATE=off turns it off for the whole image.
 
   ritmo_update.py            check now and then every 30 minutes (the service)
   ritmo_update.py --once     one check, then exit
@@ -27,10 +31,12 @@ it off for the whole image.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import json
 import os
 import py_compile
+import random
 import shutil
 import subprocess
 import sys
@@ -61,6 +67,8 @@ RITMO_FILES = ("ritmo_boot.py", "ritmo_update.py", "github_app.json", "update.js
 API = "https://api.github.com"
 FIRST_CHECK_S = 180
 EVERY_S = 1800
+# Release tag -> the installed commit it was judged against: nothing to redo until either changes.
+SETTLED: dict = {}
 PYTHON = "/opt/hermes/.venv/bin/python3"
 AS_AGENT = ("/command/s6-setuidgid", "hermes")
 IS_ROOT = getattr(os, "geteuid", lambda: -1)() == 0
@@ -96,16 +104,19 @@ def write_status(**fields) -> None:
 
 
 def atomic_write(path: str, data: bytes, mode: int = 0o644) -> None:
+    """Mode and owner set through the open descriptor, never by name: SOUL.md is written into the
+    agent's own home, where a name could be swapped for a symlink between two calls."""
     descriptor, staged = tempfile.mkstemp(prefix=".ritmo-", dir=os.path.dirname(path))
     try:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(data)
-        os.chmod(staged, mode)
-        if IS_ROOT:
-            os.chown(staged, 0, 0)
-        os.replace(staged, path)
+            handle.flush()
+            os.fchmod(handle.fileno(), mode)
+            if IS_ROOT:
+                os.fchown(handle.fileno(), 0, 0)
+        os.replace(staged, path)   # a rename moves a link itself, it never writes through one
     except BaseException:
-        if os.path.exists(staged):
+        with contextlib.suppress(OSError):
             os.unlink(staged)
         raise
 
@@ -132,17 +143,27 @@ def enabled() -> bool:
     return read_json(os.path.join(HOME, "ritmo", "config.json"), {}).get("auto_update", True) is not False
 
 
-def newest_release(repo: str) -> tuple[str, str]:
-    tag = get_json(f"/repos/{repo}/releases/latest")["tag_name"]
-    return tag, get_json(f"/repos/{repo}/commits/{tag}")["sha"]
+def newest_tag(repo: str) -> str:
+    return get_json(f"/repos/{repo}/releases/latest")["tag_name"]
 
 
-def is_ahead(repo: str, have: str, want: str) -> bool:
+def why_not(repo: str, have: str, want: str) -> str:
+    """Empty when `want` is a release to install over `have`; otherwise the reason it is not."""
     if not have:
-        return True   # an image built without a commit: any release is newer
+        return "this image does not know its commit (a local build), so it never updates itself"
     if have == want:
-        return False
-    return get_json(f"/repos/{repo}/compare/{have}...{want}").get("status") == "ahead"
+        return "up to date"
+    try:
+        status = get_json(f"/repos/{repo}/compare/{have}...{want}").get("status")
+        # Only what reached the default branch, which changes through reviewed pull requests.
+        on_main = get_json(f"/repos/{repo}/compare/{want}...HEAD").get("status") in ("ahead", "identical")
+    except UpdateError as error:
+        return f"cannot compare with the installed commit ({error})"
+    if status != "ahead":
+        return f"the release is {status} of this image, not ahead"
+    if not on_main:
+        return "the release is not on the default branch"
+    return ""
 
 
 def unpack(archive: str, into: str) -> str:
@@ -206,7 +227,6 @@ def run_tests(src: str) -> None:
         argv = [*AS_AGENT, "env", "HOME=/tmp", PYTHON, "-B", "-m", "unittest", "discover", "-s", "tests"]
     for current, dirs, files in os.walk(src):
         os.chmod(current, 0o755)
-    os.chmod(os.path.dirname(src), 0o755)
     try:
         result = subprocess.run(argv, cwd=src, capture_output=True, text=True, timeout=600)
     except (OSError, subprocess.TimeoutExpired) as error:
@@ -270,12 +290,17 @@ def install(src: str, skills: list[str]) -> bool:
 
 
 def after_install() -> list[str]:
+    """The boot hooks, each as the user it must run as. The skills hook works inside the agent's
+    home, so it runs as the agent: root never touches a path the agent could have swapped."""
     problems = []
     for hook in HOOKS:
         if not os.path.exists(hook):
             continue
+        argv = ["/bin/sh", hook]
+        if hook.endswith("40-ritmo-skills") and IS_ROOT:
+            argv = [*AS_AGENT, *argv]
         try:
-            result = subprocess.run(["/bin/sh", hook], capture_output=True, text=True, timeout=300)
+            result = subprocess.run(argv, capture_output=True, text=True, timeout=300)
             if result.returncode != 0:
                 problems.append(f"{os.path.basename(hook)}: {(result.stderr or result.stdout)[-300:]}")
         except (OSError, subprocess.TimeoutExpired) as error:
@@ -294,12 +319,20 @@ def check_once(source: str | None = None) -> bool:
         raise UpdateError("this image has no update.json")
     have = read_json(os.path.join(RITMO_DIR, "installed.json"), {}).get("commit", "")
     with tempfile.TemporaryDirectory(prefix="ritmo-update-") as work:
+        os.chmod(work, 0o755)   # the agent runs the release's tests from here
         if source:
             tag, sha, src = "local", "local", source
         else:
-            tag, sha = newest_release(repo)
-            if not is_ahead(repo, have, sha):
-                write_status(state="up_to_date", commit=have, latest=tag)
+            tag = newest_tag(repo)
+            if SETTLED.get(tag) == have:
+                return False   # decided already: one request per check while nothing changes
+            sha = get_json(f"/repos/{repo}/commits/{tag}")["sha"]
+            reason = why_not(repo, have, sha)
+            if reason:
+                write_status(state="up_to_date" if reason == "up to date" else "skipped",
+                             commit=have, latest=tag, **({} if reason == "up to date" else {"reason": reason}))
+                if not reason.startswith("cannot compare"):
+                    SETTLED[tag] = have
                 return False
             log(f"installing {tag} ({sha[:12]})")
             src = download(repo, sha, work)
@@ -308,13 +341,18 @@ def check_once(source: str | None = None) -> bool:
         except UpdateError as error:
             write_status(state="skipped", commit=have, latest=tag, reason=str(error)[:1500])
             log(f"{tag} not installed: {error}")
+            SETTLED[tag] = have
             return False
         restart = install(src, skills)
-        atomic_write(os.path.join(RITMO_DIR, "installed.json"),
-                     json.dumps({"commit": sha, "tag": tag, "at": now()}).encode())
     problems = after_install()
-    write_status(state="installed", commit=sha, latest=tag, problems=problems)
-    log(f"{tag} installed" + (f"; hooks: {problems}" if problems else ""))
+    if problems:
+        # Not recorded as installed: the next check installs it again and reruns the hooks.
+        write_status(state="installed_with_problems", commit=have, latest=tag, problems=problems)
+        log(f"{tag} installed, hooks failed (retrying next check): {problems}")
+        return restart
+    atomic_write(os.path.join(RITMO_DIR, "installed.json"), json.dumps({"commit": sha, "tag": tag, "at": now()}).encode())
+    write_status(state="installed", commit=sha, latest=tag, problems=[])
+    log(f"{tag} installed")
     return restart
 
 
@@ -331,7 +369,8 @@ def main(argv: list[str] | None = None) -> int:
             log(traceback.format_exc())
             return 1
         return 0
-    time.sleep(FIRST_CHECK_S)
+    # Spread out: agents on one address share GitHub's 60 unauthenticated requests an hour.
+    time.sleep(FIRST_CHECK_S + random.randint(0, 600))
     while True:
         try:
             if check_once():
@@ -339,7 +378,7 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as error:  # noqa: BLE001 -- the service never dies; it tries again later
             write_status(state="error", reason=str(error)[:1500])
             log(traceback.format_exc())
-        time.sleep(EVERY_S)
+        time.sleep(EVERY_S + random.randint(-300, 300))
 
 
 if __name__ == "__main__":

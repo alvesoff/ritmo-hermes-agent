@@ -406,10 +406,12 @@ class GitHub:
         """A text file of the default branch, or "" when it does not exist."""
         status, data, _ = self.request("GET", f"{GITHUB_API}/repos/{repo}/contents/{urllib.parse.quote(path)}",
                                        token=self.token)
-        if status == 404 or not isinstance(data, dict) or data.get("type") != "file":
+        if status == 404:
             return ""
         if status != 200:
             raise EquipeError(f"GitHub GET {path} answered {status}")
+        if not isinstance(data, dict) or data.get("type") != "file":
+            return ""
         text = base64.b64decode(data.get("content") or "").decode("utf-8", "replace")
         return text if len(text) <= limit else text[:limit] + "\n[...]"
 

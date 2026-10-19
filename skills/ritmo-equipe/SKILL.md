@@ -90,7 +90,9 @@ step 2).
 - `demand show <id>`: one demand, whatever its status.
 - `demand update <id> [--due YYYY-MM-DD|none] [--start ...] [--priority ...] [--title ...] [--project ID] [--status todo|doing|review|done] [--reason "what is missing"] [--description ...]`:
   only what the owner asked to change. "Empurra os prazos da Gabriela uma semana": `demand list --person LOGIN`,
-  then one `update` per demand, then one message with the new dates.
+  then `show` and one `update` per demand (move `--start` too when it has one, so it never ends after the
+  due date), then one message with the new dates. An error that says some fields WERE saved: never send
+  those again.
 - `demand delete <id>`: only demands the owner named. For more than one, list them (id and title) and wait for
   their "ok" first. A demand you created by mistake: delete it and say so.
 

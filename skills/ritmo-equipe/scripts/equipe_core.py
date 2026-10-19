@@ -534,7 +534,10 @@ class RitmoBoard:
             raise EquipeError("the board connection was revoked or expired; run `board connect` again")
         if status not in ok:
             message = data.get("error") if isinstance(data, dict) else data
-            raise EquipeError(f"board {method} {route} answered {status}: {message}")
+            changed = data.get("jaMudou") if isinstance(data, dict) else None
+            # Part of a change can already be saved (and the person notified): say so, so it is not sent again.
+            raise EquipeError(f"board {method} {route} answered {status}: {message}"
+                              + (f"; these fields WERE saved, do not send them again: {changed}" if changed else ""))
         return data
 
     def get(self, ref: str) -> dict:

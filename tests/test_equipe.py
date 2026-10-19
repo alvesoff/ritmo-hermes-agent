@@ -569,11 +569,13 @@ class FakeBoard:
             self.demands.append(demand)
             return 201, {"id": demand["id"], "url": f"https://painel.example.com/tarefas?t={demand['id']}"}, {}
         if method == "GET" and path.startswith("/api/ritmo/v1/demandas?"):
-            return 200, {"demandas": [dict(d, githubUrl=d.get("githubUrl")) for d in self.demands]}, {}
+            return 200, {"demandas": [dict(d) for d in self.demands if not d.get("deleted")]}, {}
         if method == "PATCH" and re.match(r"/api/ritmo/v1/demandas/\d+$", path):
             d = self.demands[int(path.rsplit("/", 1)[1]) - 1]
-            d.update({{"dueDate": "dueDate"}.get(k, k): v for k, v in body.items()})
-            return 200, {"ok": True, "id": d["id"]}, {}
+            if "motivo" in body and body.get("status") != "doing":
+                return 400, {"error": 'o motivo só vale ao devolver para "doing"'}, {}
+            d.update(body)
+            return 200, {"ok": True, "demanda": dict(d)}, {}
         if method == "DELETE" and re.match(r"/api/ritmo/v1/demandas/\d+$", path):
             self.demands[int(path.rsplit("/", 1)[1]) - 1]["deleted"] = True
             return 200, {"ok": True}, {}
@@ -667,11 +669,29 @@ class OwnerDemands(Home):
         self.assertIsNone(self.board.demands[1]["dueDate"])
         code, bad = self.cli("demand", "update", "2", "--due", "semana que vem")
         self.assertIn("YYYY-MM-DD", bad["error"])
+        for argv, why in ((["--due", ""], "YYYY-MM-DD"), (["--description", " "], "is empty"),
+                          (["--reason", "falta teste"], "--status doing")):
+            code, refused = self.cli("demand", "update", "2", *argv)
+            self.assertIn(why, refused["error"], argv)
+        code, back = self.cli("demand", "update", "2", "--status", "doing", "--reason", "falta teste")
+        self.assertEqual(back["changed"], ["motivo", "status"])
         code, empty = self.cli("demand", "update", "2")
         self.assertIn("say what to change", empty["error"])
+        state = core.load_state()
+        state["followups"]["acme/app#7"] = {"id": "2", "url": "x"}
+        core.write_json("equipe_state.json", state)
         code, gone = self.cli("demand", "delete", "2")
         self.assertEqual(gone["deleted"]["title"], "Divisão")
-        self.assertTrue(self.board.demands[1]["deleted"])
+        self.assertNotIn("acme/app#7", core.load_state()["followups"], "a follow-up pointing at it is forgotten")
+        code, listed = self.cli("demand", "list", "--repo", "app")
+        self.assertEqual([d["title"] for d in listed["demands"]], ["Subtração"])
+
+    def test_list_by_repo_does_not_bring_a_repo_with_a_longer_name(self):
+        self.cli("demand", "create", REPO, "--person", "ana", "--title", "Do app", "--description", "x")
+        self.board.demands.append({"id": 2, "title": "Do admin", "status": "todo", "person": "ana@example.com",
+                                   "githubUrl": f"https://github.com/{REPO}-admin"})
+        code, listed = self.cli("demand", "list", "--repo", "app")
+        self.assertEqual([d["title"] for d in listed["demands"]], ["Do app"])
 
     def test_changing_demands_needs_a_connected_board(self):
         core.save_team(dict(self.team, board={"type": "github", "url": ""}))

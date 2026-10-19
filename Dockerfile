@@ -33,11 +33,11 @@ RUN mkdir -p /opt/ritmo \
     done \
  && rm -rf /tmp/ritmo-skills
 
-COPY image/ritmo/ritmo_boot.py /opt/ritmo/ritmo_boot.py
+COPY image/ritmo/ritmo_boot.py image/ritmo/github_app.json /opt/ritmo/
 COPY image/s6-overlay/ /etc/s6-overlay/
 COPY image/cont-init.d/40-ritmo-skills image/cont-init.d/41-ritmo-refresh-persona /etc/cont-init.d/
 RUN chown -R root:root /opt/ritmo \
- && chmod 0644 /opt/ritmo/ritmo_boot.py /opt/ritmo/skills.list \
+ && chmod 0644 /opt/ritmo/ritmo_boot.py /opt/ritmo/github_app.json /opt/ritmo/skills.list \
  && chmod 0755 /etc/s6-overlay/scripts/ritmo-boot.sh \
                /etc/cont-init.d/40-ritmo-skills \
                /etc/cont-init.d/41-ritmo-refresh-persona

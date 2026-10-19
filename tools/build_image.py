@@ -36,6 +36,8 @@ SOURCE_URL = "https://github.com/alvesoff/ritmo-hermes-agent"
 FILES = [
     ("runtime/persona.md", "opt/hermes/plow-seed/persona.md", 0o644),
     ("image/ritmo/ritmo_boot.py", "opt/ritmo/ritmo_boot.py", 0o644),
+    # The GitHub App the Team module connects through (public client id; no secret anywhere).
+    ("image/ritmo/github_app.json", "opt/ritmo/github_app.json", 0o644),
     ("image/s6-overlay/scripts/ritmo-boot.sh", "etc/s6-overlay/scripts/ritmo-boot.sh", 0o755),
     ("image/s6-overlay/s6-rc.d/ritmo-boot/type", "etc/s6-overlay/s6-rc.d/ritmo-boot/type", 0o644),
     ("image/s6-overlay/s6-rc.d/ritmo-boot/up", "etc/s6-overlay/s6-rc.d/ritmo-boot/up", 0o644),

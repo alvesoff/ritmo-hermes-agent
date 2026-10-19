@@ -58,8 +58,8 @@ class Layer(unittest.TestCase):
         for name in ("opt", "opt/hermes", "opt/hermes/skills", "etc", "etc/cont-init.d", "etc/s6-overlay"):
             self.assertNotIn(name, self.members, "a base directory would lose its owner and mode")
 
-    def test_skills_list_names_ritmo(self):
-        self.assertEqual(self.contents["opt/ritmo/skills.list"], b"ritmo\n")
+    def test_skills_list_names_every_skill(self):
+        self.assertEqual(self.contents["opt/ritmo/skills.list"], b"ritmo\nritmo-equipe\n")
 
 
 if __name__ == "__main__":

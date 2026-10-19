@@ -387,6 +387,20 @@ class Backup(Home):
         code, again = self.cli("import", exported["code"])
         self.assertEqual(again["restored"]["items_added"], 0, "importing twice adds nothing")
 
+    def test_team_settings_travel_but_connections_do_not(self):
+        self.configure(name="Ana")
+        core.write_json("equipe.json", {"enabled": True, "repos": [{"repo": "acme/app"}]})
+        core.write_json("github.json", {"access_token": "secret"})
+        code, exported = self.cli("export")
+        shutil.rmtree(os.path.join(self.home, "ritmo"))
+        code, restored = self.cli("import", exported["code"])
+        self.assertEqual(code, 0, restored)
+        self.assertTrue(restored["restored"]["team"])
+        self.assertIn("reconnect", restored)
+        self.assertEqual(core.read_json("equipe.json", {})["repos"][0]["repo"], "acme/app")
+        self.assertNotIn("secret", json.dumps(ritmo.decode_backup(exported["code"])))
+        self.assertFalse(os.path.exists(core.path("github.json")))
+
     def test_any_words_after_the_code_are_ignored(self):
         self.configure(name="Ana")
         code, exported = self.cli("export")

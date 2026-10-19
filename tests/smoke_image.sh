@@ -10,7 +10,7 @@ PY=/opt/hermes/.venv/bin/python3
 AS_AGENT="/command/s6-setuidgid hermes env HOME=/tmp/rh HERMES_HOME=/tmp/rh"
 
 echo "== files"
-for f in /opt/hermes/plow-seed/persona.md /opt/ritmo/ritmo_boot.py /opt/ritmo/skills.list \
+for f in /opt/hermes/plow-seed/persona.md /opt/ritmo/ritmo_boot.py /opt/ritmo/skills.list /opt/ritmo/github_app.json \
          /opt/hermes/skills/ritmo/SKILL.md /opt/hermes/skills/ritmo/scripts/ritmo.py \
          /etc/s6-overlay/scripts/ritmo-boot.sh /etc/cont-init.d/40-ritmo-skills \
          /etc/s6-overlay/s6-rc.d/ritmo-boot/up /etc/s6-overlay/s6-rc.d/hermes-gateway/dependencies.d/ritmo-boot; do
@@ -38,13 +38,16 @@ echo "== hermes cron create --help (for the log)"
 $AS_AGENT /opt/hermes/bin/hermes cron create --help | head -40 || true
 
 echo "== boot step"
-$AS_AGENT RITMO_SCRIPTS_SOURCE=/opt/hermes/skills/ritmo/scripts $PY /opt/ritmo/ritmo_boot.py
+$AS_AGENT $PY /opt/ritmo/ritmo_boot.py
 $AS_AGENT $PY - <<'PY' || fail "jobs.json is not what the boot step should register"
 import json, yaml
 jobs = {j["name"]: j for j in json.load(open("/tmp/rh/cron/jobs.json"))["jobs"]}
 print(json.dumps(jobs, indent=1, default=str)[:4000])
-assert set(jobs) >= {"ritmo-lembretes", "ritmo-rotinas"}, jobs.keys()
-lemb, rot = jobs["ritmo-lembretes"], jobs["ritmo-rotinas"]
+assert set(jobs) >= {"ritmo-lembretes", "ritmo-rotinas", "ritmo-equipe"}, jobs.keys()
+lemb, rot, eq = jobs["ritmo-lembretes"], jobs["ritmo-rotinas"], jobs["ritmo-equipe"]
+assert eq.get("script", "").endswith("equipe_gate.py") and "ritmo-equipe" in (eq.get("skills") or []), eq
+assert eq.get("model") == "anthropic/claude-sonnet-5", {k: eq.get(k) for k in ("model", "provider", "model_snapshot")}
+assert eq["schedule"]["expr"] == "*/5 * * * *", eq["schedule"]
 assert lemb.get("no_agent") is True, lemb
 assert lemb.get("script", "").endswith("ritmo_lembretes.py"), lemb
 assert rot.get("script", "").endswith("ritmo_rotinas.py"), rot
@@ -59,9 +62,13 @@ assert config["cron"]["wrap_response"] is False
 assert config["cron"]["mirror_delivery"] is True
 print("jobs and config OK")
 PY
-for f in ritmo_core.py ritmo_lembretes.py ritmo_rotinas.py; do
+for f in ritmo_core.py ritmo_lembretes.py ritmo_rotinas.py equipe_core.py equipe.py equipe_gate.py; do
   [ -f "/tmp/rh/scripts/$f" ] || fail "boot step did not publish $f"
 done
+gate=$($AS_AGENT $PY /tmp/rh/scripts/equipe_gate.py | tail -1)
+[ "$gate" = '{"wakeAgent": false}' ] || fail "the team gate is not silent while the module is off: $gate"
+$AS_AGENT python3 /opt/hermes/skills/ritmo-equipe/scripts/equipe.py team show | grep -q '"setup_missing"' \
+  || fail "equipe.py does not run on the agent's python3"
 [ "$(stat -c %a /tmp/rh/config.yaml)" = "640" ] || fail "boot step changed config.yaml's mode to $(stat -c %a /tmp/rh/config.yaml)"
 
 echo "== boot step again: idempotent"

@@ -30,6 +30,8 @@ it up unless they do.
    Running `repo add` again changes only the flags you pass.
 4. **People.** `team person add <name> --github LOGIN --level junior|mid|senior [--board-person EMAIL]`.
    For a Ritmo board, `board people` lists everyone with their email and GitHub login.
+   Only PRs opened by these logins are reviewed and merged; the owner's own PRs and bots
+   are left to the owner. Say so when you list the team.
 5. **Rules**, in the owner's words, for example "back-end before front-end", "one commit
    per step" or "docs updated": `team set '{"rules": [...]}'`.
 6. `team set '{"enabled": true}'` (it needs Ritmo's own setup first: the owner's city).
@@ -66,6 +68,8 @@ Notices:
   (CI change, no CI, commits that skipped review), say what they can answer.
 - `review_failed`: you could not review that PR twice; ask the owner to look or say
   "revisa o PR N".
+- `outside`: someone not on the team opened a PR (maybe a GitHub login typed wrong, or a
+  new person). Ask whether to add them; until then it is not reviewed.
 - `problem` / `problem_solved`: a repository or the GitHub connection broke or recovered
   (an expired connection means "conectar github" again).
 

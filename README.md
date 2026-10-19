@@ -18,8 +18,8 @@ Built on [Plow](https://github.com/plow-pbc/plow-agents) and the
 - **Quiet hours**: it never starts a conversation while you sleep, except for a
   reminder you set for that exact time.
 
-**Team (optional).** If people deliver code for you: Ritmo reads each pull request
-against its demand (GitHub Issues, or any board with the Ritmo board API), merges what is
+**Team (optional).** If people deliver code for you: Ritmo reads each pull request they
+open (not yours, not bots') against its demand (GitHub Issues, or any board with the Ritmo board API), merges what is
 done into develop, promotes develop to production when it is green and you are awake, and
 opens a follow-up demand for what is missing. Merges only ever happen on the exact commit
 that was reviewed, with every check green; see [skills/ritmo-equipe](skills/ritmo-equipe/SKILL.md).

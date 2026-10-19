@@ -153,6 +153,9 @@ def cmd_github(args):
             repos += [r["full_name"] for r in data.get("repositories", [])]
         result.update(login=me["login"], repositories=repos)
         with core.locked():
+            saved = core.read_json("github.json", {})
+            saved["login"] = me["login"]   # the owner's own PRs are theirs, not the team's to review
+            core.write_json("github.json", saved, private=True)
             state = core.load_state()
             state["problems"].pop("github", None)
             core.write_json("equipe_state.json", state)
@@ -215,12 +218,23 @@ def review_items(team: dict, github: core.GitHub, state: dict, limit: int, probl
     One repository failing (app uninstalled, a 404) is recorded in `problems` and the others go on.
     """
     items = []
+    owner = core.read_json("github.json", {}).get("login", "").lower()
     for repo in team["repos"]:
         try:
             bases = [repo["dev"]] + ([repo["prod"]] if repo["prod"] != repo["dev"] else [])
             for base in bases:
-                for pr in github.pages(f"/repos/{repo['repo']}/pulls?state=open&base={base}", limit=50):
+                for pr in github.pages(f"/repos/{repo['repo']}/pulls?state=open&base={base}", limit=100):
                     if pr.get("draft") or pr["head"]["ref"] == repo["dev"]:
+                        continue
+                    author = (pr.get("user") or {}).get("login", "")
+                    # Only the team's work. The owner's own PRs and bots are skipped quietly; anyone else
+                    # (a login typed wrong, someone not added yet) is told to the owner once per PR.
+                    if core.person_for(team, author) is None:
+                        outside = state.setdefault("outside_told", {})
+                        pr_key = key(repo["repo"], pr["number"])
+                        if author and author.lower() != owner and not author.endswith("[bot]") and pr_key not in outside:
+                            outside[pr_key] = author
+                            items.append({"type": "outside", "repo": repo["repo"], "number": pr["number"], "author": author})
                         continue
                     record = state["reviews"].get(key(repo["repo"], pr["number"]), {})
                     if record.get("sha") == pr["head"]["sha"] and not record.get("retry"):
@@ -233,10 +247,10 @@ def review_items(team: dict, github: core.GitHub, state: dict, limit: int, probl
                         return items
             if problems is not None:
                 problems[repo["repo"].lower()] = ""
-        except core.EquipeError as error:
+        except Exception as error:  # noqa: BLE001 -- one repository's surprise must not stop the others
             if problems is None:
                 raise
-            problems[repo["repo"].lower()] = str(error)
+            problems[repo["repo"].lower()] = f"{error.__class__.__name__}: {error}"
     return items
 
 
@@ -410,7 +424,11 @@ def cmd_followup(args):
 
 def cmd_link(args):
     team = core.load_team()
-    core.repo_for(team, args.repo)
+    repo = core.repo_for(team, args.repo)
+    author = (gh().call("GET", f"/repos/{repo['repo']}/pulls/{args.number}").get("user") or {}).get("login", "")
+    if core.person_for(team, author) is None:
+        raise EquipeError(f"{author or 'the author'} is not on the team, so the PR is not reviewed; "
+                          "add them with `team person add` first")
     with core.locked():
         state = core.load_state()
         state["asked"][key(args.repo, args.number)] = {"demand": str(args.demand)}
@@ -425,7 +443,7 @@ def promote(team: dict, repo: dict, github: core.GitHub, state: dict, owner_ok: 
     """develop → main with a merge commit, only with commits Ritmo reviewed (unless the owner says otherwise)."""
     if repo["dev"] == repo["prod"]:
         return {"promoted": False, "blockers": [f"{repo['repo']} has a single branch; nothing to promote"]}
-    unreviewed = core.unreviewed_commits(github, state, repo)
+    unreviewed = core.unreviewed_commits(github, state, repo, team)
     if unreviewed and not owner_ok:
         return {"promoted": False, "blockers": [
             f"{len(unreviewed)} commit(s) on {repo['dev']} did not pass a Ritmo review "

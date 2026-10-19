@@ -224,6 +224,70 @@ class MergeRules(Home):
         self.assertEqual(set(state["reviewed_commits"][REPO]), {"p" * 40, "m" * 40})
 
 
+class OnlyTheTeamMerges(Home):
+    def setUp(self):
+        super().setUp()
+        os.environ["RITMO_NOW"] = "2026-10-19T15:00:00+00:00"
+
+    def test_a_pr_from_outside_the_team_never_merges_on_its_own(self):
+        self.gh.pr["user"]["login"] = "alvesoff"
+        self.assertTrue(any("not on the team" in b for b in self.blockers()))
+        self.assertEqual(self.blockers(owner_ok=True), [], "the owner may merge it themselves")
+        self.gh.pr["user"] = None
+        self.assertTrue(any("not on the team" in b for b in self.blockers()), "a deleted account is not the team")
+
+    def test_promotion_prs_are_not_held_by_the_author_rule(self):
+        self.gh.pr["user"]["login"] = "alvesoff"
+        self.gh.pr["head"]["ref"], self.gh.pr["base"]["ref"] = "develop", "main"
+        self.assertFalse(any("not on the team" in b for b in self.blockers(production=True)))
+
+    def test_owner_and_bot_commits_on_develop_do_not_jam_promotions(self):
+        state = core.load_state()
+        commits = [{"sha": "1" * 40, "author": {"login": "alvesoff"}, "committer": {"login": "web-flow"}},
+                   {"sha": "2" * 40, "author": {"login": "dependabot[bot]"}, "committer": None},
+                   {"sha": "3" * 40, "author": {"login": "ana"}, "committer": {"login": "ana"}},
+                   {"sha": "4" * 40, "author": None, "committer": None}]
+        original = self.gh.__call__
+
+        def router(method, url, **kw):
+            if "/compare/main...develop" in url:
+                return 200, {"ahead_by": 4, "commits": commits}, {}
+            return original(method, url, **kw)
+
+        found = core.unreviewed_commits(core.GitHub("t", router), state, self.repo, self.team)
+        self.assertEqual(found, ["3" * 40, "4" * 40], "the team's own push and an unknown author are held")
+
+
+class OnlyTheTeam(Home):
+    def test_prs_from_outside_the_team_are_never_reviewed(self):
+        def pr(number, login):
+            return {"number": number, "draft": False, "user": {"login": login},
+                    "head": {"sha": f"{number}" * 40 if number < 10 else SHA, "ref": f"feat/{number}"}}
+
+        open_prs = [pr(5, "ana"), pr(6, "alvesoff"), pr(7, "dependabot[bot]")]
+        original = self.gh.__call__
+
+        def router(method, url, **kw):
+            if "/pulls?state=open&base=develop" in url:
+                return 200, open_prs, {}
+            if "/pulls?state=open&base=main" in url:
+                return 200, [], {}
+            if "/check-runs" in url:
+                return 200, {"total_count": 1, "check_runs": [{"name": "ci", "status": "completed", "conclusion": "success"}]}, {}
+            if url.endswith("/status"):
+                return 200, {"statuses": []}, {}
+            return original(method, url, **kw)
+
+        core.write_json("github.json", {"access_token": "t", "login": "alvesoff"}, private=True)
+        state = core.load_state()
+        open_prs.append(pr(8, "gabrielax"))
+        items = equipe.review_items(self.team, core.GitHub("t", router), state, limit=10)
+        self.assertEqual([(i["type"], i["number"]) for i in items], [("review", 5), ("outside", 8)],
+                         "Ana is reviewed; the owner and the bot are skipped quietly; an unknown person is told once")
+        again = equipe.review_items(self.team, core.GitHub("t", router), state, limit=10)
+        self.assertEqual([i["type"] for i in again], ["review"], "the unknown person is told only once")
+
+
 class Promotion(Home):
     def test_policies(self):
         state = core.load_state()
@@ -442,6 +506,19 @@ class Gate(Home):
             self.assertEqual(notices[0]["type"], "review_failed", "then the owner is told")
             os.environ["RITMO_NOW"] = "2026-10-19T16:40:00+00:00"
             self.assertEqual(equipe_gate.gate(), equipe_gate.SILENT, "once")
+
+    def test_a_retry_that_is_never_handed_out_is_dropped_not_looped(self):
+        self.connect()
+        state = core.load_state()
+        state["reviews"][equipe.key(REPO, 9)] = {"sha": SHA, "verdict": "in_review", "attempts": 1,
+                                                 "at": "2026-10-19T14:00:00+00:00"}
+        core.write_json("equipe_state.json", state)
+        with self.patched(review_items=lambda *a, **k: [], promote=lambda *a, **k: {"promoted": False, "nothing_new": True}):
+            self.assertEqual(equipe_gate.gate(), equipe_gate.SILENT)
+            self.assertTrue(core.load_state()["reviews"][equipe.key(REPO, 9)]["retry"])
+            os.environ["RITMO_NOW"] = "2026-10-19T15:31:00+00:00"
+            self.assertEqual(equipe_gate.gate(), equipe_gate.SILENT)
+            self.assertNotIn(equipe.key(REPO, 9), core.load_state()["reviews"])
 
     def test_waiting_merges_happen_in_code_and_the_same_blocker_is_told_once(self):
         self.connect()

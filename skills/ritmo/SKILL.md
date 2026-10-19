@@ -99,7 +99,9 @@ the routine travels through the owner's chat:
   needed, the owner is already set up here: ask first, because the backup
   replaces the current settings. Then confirm in one or two lines what came
   back, name anything in `expired_during_update` (it passed while they were
-  updating), and skip onboarding. Never repeat the code.
+  updating), and skip onboarding. Never repeat the code. Write that
+  confirmation, and everything after it, in the restored `language`: the
+  forwarded code has no words to tell you the owner's language.
 
 ## Answering a reminder
 

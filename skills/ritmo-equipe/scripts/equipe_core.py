@@ -3,9 +3,10 @@ and every rule that decides whether a pull request may be merged.
 
 The LLM reads a pull request against its demand and says what it thinks. The
 code here decides what actually happens: a merge needs the exact commit that
-was reviewed, every check finished green, no change to CI workflows, an allowed
-target branch and, for production, the owner's active hours. Nothing the team
-writes in a PR can change those rules.
+was reviewed, every check finished green, no change to CI, an allowed target
+branch and, for production, the owner's active hours. A promotion to production
+carries only commits Ritmo itself reviewed and merged. Nothing the team writes
+in a PR can change those rules.
 
 Two boards are supported. `github`: the repository's own Issues. `ritmo`: any
 system that implements the Ritmo board API (see the OpenSeed painel, ritmo.js).
@@ -22,7 +23,6 @@ import json
 import os
 import re
 import tempfile
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -33,8 +33,13 @@ GITHUB_API = "https://api.github.com"
 GITHUB_WEB = "https://github.com"
 APP_FILE = os.environ.get("RITMO_GITHUB_APP_FILE", "/opt/ritmo/github_app.json")
 GREEN = {"success", "neutral", "skipped"}
+# CI lives in workflows and the composite actions they call: a PR touching either can change its own checks.
+CI_PATHS = (".github/workflows/", ".github/actions/")
+# A commit with no check at all after this long is taken as "CI does not run on PRs here".
+NO_CHECKS_AFTER = dt.timedelta(minutes=15)
 PATCH_LIMIT = 6000
 BUNDLE_LIMIT = 60000
+_SHA = re.compile(r"^[0-9a-f]{40}$")
 
 DEFAULT_TEAM: dict = {
     "version": SCHEMA_VERSION,
@@ -44,7 +49,7 @@ DEFAULT_TEAM: dict = {
     "people": [],
     "rules": [],
     "publish": "auto",           # follow-up demands: "auto" or "approve"
-    "merge_method": "merge",     # merge, squash or rebase; falls back to what the repo allows
+    "merge_method": "merge",     # merge or squash for team PRs; promotions are always merge commits
     "long_lived": ["main", "master", "develop", "release/*"],
     "review_model": "anthropic/claude-sonnet-5",
     "paused_until": "",
@@ -117,6 +122,34 @@ def write_json(name: str, data: dict, *, private: bool = False) -> None:
         raise
 
 
+def now_utc() -> dt.datetime:
+    pinned = os.environ.get("RITMO_NOW")
+    if pinned:
+        return dt.datetime.fromisoformat(pinned).astimezone(dt.timezone.utc)
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def parse_moment(text: str, field: str) -> dt.datetime:
+    """An ISO moment with its UTC offset ("Z" accepted on every Python)."""
+    try:
+        moment = dt.datetime.fromisoformat(str(text).strip().replace("Z", "+00:00"))
+    except ValueError as error:
+        raise EquipeError(f"{field} must be an ISO date and time with its offset, e.g. 2026-10-20T08:00:00-03:00") from error
+    if moment.tzinfo is None:
+        raise EquipeError(f"{field} needs its UTC offset, e.g. 2026-10-20T08:00:00-03:00")
+    return moment
+
+
+def ritmo_config() -> dict:
+    """The routine settings (timezone, quiet hours) the production rules follow."""
+    try:
+        with open(path("config.json"), encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 # --- team config ---------------------------------------------------------------
 
 def validate_team(team: dict) -> dict:
@@ -149,8 +182,8 @@ def validate_team(team: dict) -> dict:
         for flag in ("auto_merge", "allow_no_ci"):
             if not isinstance(repo[flag], bool):
                 raise EquipeError(f"{flag} must be true or false")
-        if not repo["dev"] or not repo["prod"] or repo["dev"] == repo["prod"]:
-            raise EquipeError("dev and prod must be two different branches (dev can equal prod only by leaving dev out)")
+        if not repo["dev"] or not repo["prod"]:
+            raise EquipeError("dev and prod are branch names; with a single branch, give the same name to both")
         repos.append(repo)
     merged["repos"] = repos
     people, logins = [], set()
@@ -173,15 +206,27 @@ def validate_team(team: dict) -> dict:
         raise EquipeError("rules is a list of sentences")
     if merged["publish"] not in ("auto", "approve"):
         raise EquipeError("publish is 'auto' or 'approve'")
-    if merged["merge_method"] not in ("merge", "squash", "rebase"):
-        raise EquipeError("merge_method is merge, squash or rebase")
+    if merged["merge_method"] not in ("merge", "squash"):
+        raise EquipeError("merge_method is merge or squash")
     if not isinstance(merged["long_lived"], list):
         raise EquipeError("long_lived is a list of branch names or patterns")
+    if merged["paused_until"]:
+        merged["paused_until"] = parse_moment(merged["paused_until"], "paused_until").isoformat()
+    if merged["enabled"] and not ritmo_config().get("timezone"):
+        raise EquipeError("set the owner's city and timezone in Ritmo first: production merges follow their hours")
     return merged
 
 
 def load_team() -> dict:
-    return validate_team(read_json("equipe.json", {}))
+    raw = read_json("equipe.json", {})
+    try:
+        return validate_team(raw)
+    except EquipeError as error:
+        if "timezone" in str(error):
+            # A routine reset (new agent, empty config) must not break the team commands that repair it.
+            raw["enabled"] = False
+            return validate_team(raw)
+        raise
 
 
 def save_team(team: dict) -> dict:
@@ -192,7 +237,7 @@ def save_team(team: dict) -> dict:
 
 def load_state() -> dict:
     state = read_json("equipe_state.json", {"version": SCHEMA_VERSION})
-    for key in ("reviews", "followups", "asked", "promotions"):
+    for key in ("reviews", "followups", "asked", "promotions", "reviewed_commits", "problems"):
         state.setdefault(key, {})
     return state
 
@@ -208,11 +253,10 @@ def repo_for(team: dict, name: str) -> dict:
     return repo
 
 
-def now_utc() -> dt.datetime:
-    pinned = os.environ.get("RITMO_NOW")
-    if pinned:
-        return dt.datetime.fromisoformat(pinned).astimezone(dt.timezone.utc)
-    return dt.datetime.now(dt.timezone.utc)
+def check_sha(sha: str) -> str:
+    if not _SHA.match(str(sha)):
+        raise EquipeError("use the full 40-character sha from `review` (the top-level `sha`), not a short one")
+    return sha
 
 
 # --- HTTP ----------------------------------------------------------------------
@@ -361,9 +405,14 @@ class GitHub:
 
     def checks(self, repo: str, sha: str) -> dict:
         """Every check run and commit status on a commit, as one verdict: green, pending, red or none."""
-        runs = self.call("GET", f"/repos/{repo}/commits/{sha}/check-runs?per_page=100").get("check_runs", [])
-        combined = self.call("GET", f"/repos/{repo}/commits/{sha}/status")
-        statuses = combined.get("statuses", [])
+        runs, page = [], 1
+        while True:
+            data = self.call("GET", f"/repos/{repo}/commits/{sha}/check-runs?per_page=100&page={page}")
+            runs += data.get("check_runs", [])
+            if len(runs) >= int(data.get("total_count", 0)) or not data.get("check_runs"):
+                break
+            page += 1
+        statuses = self.call("GET", f"/repos/{repo}/commits/{sha}/status").get("statuses", [])
         items = [{"name": r["name"], "state": r["status"], "conclusion": r.get("conclusion")} for r in runs]
         items += [{"name": s["context"], "state": "completed" if s["state"] != "pending" else "pending",
                    "conclusion": {"success": "success", "pending": None}.get(s["state"], "failure")} for s in statuses]
@@ -377,15 +426,27 @@ class GitHub:
             verdict = "red"
         return {"verdict": verdict, "checks": items}
 
+    def commit_age(self, repo: str, sha: str) -> dt.timedelta:
+        commit = self.call("GET", f"/repos/{repo}/commits/{sha}")
+        when = commit.get("commit", {}).get("committer", {}).get("date") or commit.get("commit", {}).get("author", {}).get("date")
+        return now_utc() - parse_moment(when, "commit date") if when else dt.timedelta(0)
+
     def has_workflows(self, repo: str) -> bool:
         return bool(self.call("GET", f"/repos/{repo}/actions/workflows?per_page=1").get("total_count"))
+
+    def pr_files(self, repo: str, pr: dict) -> list[dict]:
+        """The files of exactly the PR's head commit, so the reviewed diff and the reviewed sha are one thing."""
+        compare = self.call("GET", f"/repos/{repo}/compare/{pr['base']['sha']}...{pr['head']['sha']}")
+        return compare.get("files", [])
+
+    def pr_commits(self, repo: str, number: int) -> list[dict]:
+        return self.pages(f"/repos/{repo}/pulls/{number}/commits", limit=250)
 
 
 # --- boards ------------------------------------------------------------------------
 
-_ISSUE_REF = re.compile(r"(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?)\s*:?\s*#(\d+)", re.I)
+_ISSUE_REF = re.compile(r"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|refs?)\b\s*:?\s*#(\d+)", re.I)
 _ISSUE_URL = re.compile(r"github\.com/([\w.-]+/[\w.-]+)/issues/(\d+)", re.I)
-_PAINEL_URL = re.compile(r"/tarefas\?t=(\d+)")
 _DEMAND_WORD = re.compile(r"\bdemand(?:a|e|as)?[\s#:_-]*(\d+)\b", re.I)
 
 
@@ -398,8 +459,8 @@ def demand_refs(team: dict, pr: dict) -> list[str]:
         refs += [m.group(1) for m in _ISSUE_REF.finditer(text)]
         refs += [m.group(2) for m in _ISSUE_URL.finditer(text) if m.group(1).lower() == pr["base"]["repo"]["full_name"].lower()]
     else:
-        base = team["board"]["url"].rstrip("/")
-        refs += [m.group(1) for m in _PAINEL_URL.finditer(text) if base in text]
+        base = re.escape(team["board"]["url"].rstrip("/"))
+        refs += re.findall(base + r"/tarefas\?t=(\d+)", text)
         refs += [m.group(1) for m in _DEMAND_WORD.finditer(text)]
         refs += [m.group(1) for m in _DEMAND_WORD.finditer(branch.replace("/", " "))]
     unique: list[str] = []
@@ -415,9 +476,14 @@ class GithubIssuesBoard:
 
     def get(self, ref: str) -> dict:
         issue = self.github.call("GET", f"/repos/{self.repo}/issues/{int(ref)}")
+        # /issues/N also answers for pull requests: a PR naming itself would make its own text the "demand".
+        if issue.get("pull_request"):
+            raise EquipeError(f"#{ref} is a pull request, not a demand")
+        if issue.get("state") != "open":
+            raise EquipeError(f"#{ref} is closed")
         return {"id": str(issue["number"]), "url": issue["html_url"], "title": issue["title"],
                 "description": issue.get("body") or "", "status": issue["state"],
-                "person": [a["login"] for a in issue.get("assignees", [])], "steps": []}
+                "person": (issue.get("assignees") or [{}])[0].get("login"), "steps": []}
 
     def create(self, demand: dict) -> dict:
         body = demand["description"]
@@ -450,6 +516,8 @@ class RitmoBoard:
 
     def get(self, ref: str) -> dict:
         d = self.call("GET", f"/api/ritmo/v1/demandas/{int(ref)}")
+        if d.get("status") == "done":
+            raise EquipeError(f"demand {ref} is already done")
         return {"id": str(d["id"]), "url": d["url"], "title": d["title"], "description": d.get("description", ""),
                 "status": d["status"], "person": d.get("person", {}).get("email"), "githubUrl": d.get("githubUrl"),
                 "steps": d.get("steps", []), "dueDate": d.get("dueDate"), "priority": d.get("priority")}
@@ -523,12 +591,14 @@ def branch_matches(name: str, patterns: list[str]) -> bool:
     return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
 
 
-def in_quiet(moment: dt.datetime, ritmo_config: dict) -> bool:
-    """The owner's quiet hours, from Ritmo's own config (owner timezone)."""
+def in_quiet(moment: dt.datetime, config: dict) -> bool:
+    """The owner's quiet hours, from Ritmo's own config. Unknown hours count as quiet: production never fails open."""
     from zoneinfo import ZoneInfo
-    zone = ritmo_config.get("timezone")
-    quiet = ritmo_config.get("quiet") or {}
-    if not zone or not quiet.get("start") or not quiet.get("end"):
+    zone = config.get("timezone")
+    quiet = config.get("quiet") or {}
+    if not zone:
+        return True
+    if not quiet.get("start") or not quiet.get("end"):
         return False
     local = moment.astimezone(ZoneInfo(zone))
     minute = local.hour * 60 + local.minute
@@ -539,18 +609,23 @@ def in_quiet(moment: dt.datetime, ritmo_config: dict) -> bool:
     return first <= minute < last if first < last else (minute >= first or minute < last)
 
 
+def touches_ci(files: list[dict]) -> bool:
+    return any(f["filename"].startswith(CI_PATHS) or str(f.get("previous_filename", "")).startswith(CI_PATHS)
+               for f in files)
+
+
 def merge_blockers(github: GitHub, team: dict, repo: dict, pr: dict, reviewed_sha: str, *,
                    production: bool, ritmo_config: dict, owner_ok: bool = False) -> list[str]:
     """Every reason this PR may not be merged right now. Empty means go."""
-    blockers = []
     number = pr["number"]
+    if pr["head"]["sha"] != reviewed_sha:
+        # Nothing else is worth checking for a commit that is no longer the PR's head.
+        return ["new commits arrived after the review; it will be reviewed again"]
+    blockers = []
     if pr.get("state") != "open" or pr.get("merged"):
         blockers.append(f"PR {number} is not open")
     if pr.get("draft"):
         blockers.append(f"PR {number} is a draft")
-    if pr["head"]["sha"] != reviewed_sha:
-        # Nothing else is worth checking for a commit that is no longer the PR's head.
-        return blockers + ["new commits arrived after the review; it will be reviewed again"]
     if (pr["head"].get("repo") or {}).get("full_name", "").lower() != repo["repo"].lower():
         blockers.append("the PR comes from a fork; merging it needs the owner")
     base = pr["base"]["ref"]
@@ -559,21 +634,21 @@ def merge_blockers(github: GitHub, team: dict, repo: dict, pr: dict, reviewed_sh
     if production and repo["promote"] == "manual" and not owner_ok:
         blockers.append(f"{repo['prod']} is set to merge only with the owner's ok")
     if production and in_quiet(now_utc(), ritmo_config) and not owner_ok:
-        blockers.append("production merges wait for the owner's active hours")
-    files = github.pages(f"/repos/{repo['repo']}/pulls/{number}/files")
-    if any(f["filename"].startswith(".github/workflows/") for f in files) and not owner_ok:
-        blockers.append("the PR changes CI workflows (.github/workflows); that needs the owner's ok")
+        blockers.append("production merges wait for the owner's active hours"
+                        + ("" if ritmo_config.get("timezone") else " (Ritmo does not know the owner's timezone yet)"))
+    if touches_ci(github.pr_files(repo["repo"], pr)) and not owner_ok:
+        blockers.append("the PR changes CI (.github/workflows or .github/actions); that needs the owner's ok")
     checks = github.checks(repo["repo"], reviewed_sha)
     if checks["verdict"] == "pending":
         blockers.append("checks are still running")
     elif checks["verdict"] == "red":
         failed = [c["name"] for c in checks["checks"] if c["conclusion"] not in GREEN]
         blockers.append(f"checks failed: {', '.join(failed[:5])}")
-    elif checks["verdict"] == "none":
-        if github.has_workflows(repo["repo"]):
+    elif checks["verdict"] == "none" and not (repo["allow_no_ci"] or owner_ok):
+        if github.has_workflows(repo["repo"]) and github.commit_age(repo["repo"], reviewed_sha) < NO_CHECKS_AFTER:
             blockers.append("no checks have started yet for this commit")
-        elif not (repo["allow_no_ci"] or owner_ok):
-            blockers.append("the repository has no CI; merging without it needs the owner's ok")
+        else:
+            blockers.append("no CI runs on this PR; merging without it needs the owner's ok")
     if pr.get("mergeable") is False:
         blockers.append("the PR has conflicts with its base branch")
     elif pr.get("mergeable") is None:
@@ -581,9 +656,10 @@ def merge_blockers(github: GitHub, team: dict, repo: dict, pr: dict, reviewed_sh
     return blockers
 
 
-def merge(github: GitHub, team: dict, repo: dict, number: int, sha: str) -> dict:
-    """Merge with the reviewed SHA pinned, falling back to the methods the repository allows."""
-    methods = [team["merge_method"]] + [m for m in ("merge", "squash", "rebase") if m != team["merge_method"]]
+def merge(github: GitHub, team: dict, repo: dict, number: int, sha: str, *, promotion: bool = False) -> dict:
+    """Merge with the reviewed SHA pinned. Promotions are always merge commits (develop's history must reach
+    production as is); team PRs fall back between merge and squash only when the repository forbids the method."""
+    methods = ["merge"] if promotion else [team["merge_method"]] + [m for m in ("merge", "squash") if m != team["merge_method"]]
     last = ""
     for method in methods:
         status, data, _ = github.request("PUT", f"{GITHUB_API}/repos/{repo['repo']}/pulls/{number}/merge",
@@ -593,7 +669,7 @@ def merge(github: GitHub, team: dict, repo: dict, number: int, sha: str) -> dict
         last = data.get("message") if isinstance(data, dict) else str(data)
         if status == 409:
             return {"merged": False, "reason": "the PR head changed; it will be reviewed again"}
-        if status != 405:
+        if status != 405 or "not allowed" not in str(last).lower():
             break
     return {"merged": False, "reason": last or "GitHub refused the merge"}
 
@@ -612,18 +688,33 @@ def delete_branch_if_safe(github: GitHub, team: dict, repo: dict, pr: dict) -> b
     return status == 204
 
 
-def promotion_due(repo: dict, ritmo_config: dict, state: dict) -> bool:
-    """Whether a dev→prod promotion may start now, by the repo's policy and the owner's clock."""
-    if repo["dev"] == repo["prod"] or repo["promote"] == "manual":
+def remember_reviewed(state: dict, repo: str, shas: list[str]) -> None:
+    """Commits that went through a Ritmo review into dev: the only ones a promotion may carry."""
+    known = state["reviewed_commits"].setdefault(repo.lower(), [])
+    for sha in shas:
+        if sha and sha not in known:
+            known.append(sha)
+    del known[:-5000]
+
+
+def unreviewed_commits(github: GitHub, state: dict, repo: dict) -> list[str]:
+    """Commits on dev that would reach production without having passed a Ritmo review."""
+    compare = github.call("GET", f"/repos/{repo['repo']}/compare/{repo['prod']}...{repo['dev']}")
+    known = set(state["reviewed_commits"].get(repo["repo"].lower(), []))
+    return [c["sha"] for c in compare.get("commits", []) if c["sha"] not in known]
+
+
+def promotion_due(repo: dict, config: dict, state: dict) -> bool:
+    """Whether a dev-to-prod promotion may start now, by the repo's policy and the owner's clock."""
+    if repo["dev"] == repo["prod"] or repo["promote"] == "manual" or not config.get("timezone"):
         return False
     moment = now_utc()
-    if in_quiet(moment, ritmo_config):
+    if in_quiet(moment, config):
         return False
     if repo["promote"] == "now":
         return True
     from zoneinfo import ZoneInfo
-    zone = ritmo_config.get("timezone") or "UTC"
-    local = moment.astimezone(ZoneInfo(zone))
+    local = moment.astimezone(ZoneInfo(config["timezone"]))
     target = local.replace(hour=int(repo["promote"][:2]), minute=int(repo["promote"][3:]), second=0, microsecond=0)
     done = state["promotions"].get(repo["repo"].lower())
     return local >= target and done != local.date().isoformat()

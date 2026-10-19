@@ -377,8 +377,13 @@ def cmd_export(args):
     out({"code": code, **summary})
 
 
+def unescape(text: str) -> str:
+    """The chat stores incoming text markdown-escaped (`\\_`, `\\-`); a real restore tripped on it."""
+    return re.sub(r"\\([_\-.])", r"\1", text)
+
+
 def decode_backup(text: str) -> dict:
-    match = BACKUP_PATTERN.search(text)
+    match = BACKUP_PATTERN.search(unescape(text))
     if not match:
         raise RitmoError(f"a backup starts with {BACKUP_PREFIX} and ends with a dot; ask the owner to forward "
                          "the whole backup message")
@@ -471,7 +476,7 @@ def backup_from_chat() -> dict:
             import time
             time.sleep(0.2)
     for (content,) in rows or []:
-        words = owner_words(message_text(content))
+        words = unescape(owner_words(message_text(content)))
         if BACKUP_PREFIX in words:
             # The last code in the message: anything before it is quoted or older.
             codes = [m.group(0) for m in BACKUP_PATTERN.finditer(words)]

@@ -502,6 +502,12 @@ class RestoreFromChat(Home):
                          "another person's chat, a group and Ritmo's own mirrored export are never read")
         self.assertEqual(core.load_config()["wake"], "05:20")
 
+    def test_a_markdown_escaped_message_still_restores(self):
+        escaped = self.mine.replace("_", "\\_").replace("-", "\\-")
+        self.chat_store(("s-owner", escaped[:70] + "\n" + escaped[70:], 1))
+        code, restored = self.restore()
+        self.assertEqual(code, 0, restored)
+
     def test_a_chat_that_moved_to_a_new_session_still_counts(self):
         self.chat_store(("s-owner-before", self.mine, 2))
         code, restored = self.restore()

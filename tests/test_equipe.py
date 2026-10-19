@@ -224,6 +224,30 @@ class MergeRules(Home):
         self.assertEqual(set(state["reviewed_commits"][REPO]), {"p" * 40, "m" * 40})
 
 
+class OnlyTheTeam(Home):
+    def test_prs_from_outside_the_team_are_never_reviewed(self):
+        def pr(number, login):
+            return {"number": number, "draft": False, "user": {"login": login},
+                    "head": {"sha": f"{number}" * 40 if number < 10 else SHA, "ref": f"feat/{number}"}}
+
+        open_prs = [pr(5, "ana"), pr(6, "alvesoff"), pr(7, "dependabot[bot]")]
+        original = self.gh.__call__
+
+        def router(method, url, **kw):
+            if "/pulls?state=open&base=develop" in url:
+                return 200, open_prs, {}
+            if "/pulls?state=open&base=main" in url:
+                return 200, [], {}
+            if "/check-runs" in url:
+                return 200, {"total_count": 1, "check_runs": [{"name": "ci", "status": "completed", "conclusion": "success"}]}, {}
+            if url.endswith("/status"):
+                return 200, {"statuses": []}, {}
+            return original(method, url, **kw)
+
+        items = equipe.review_items(self.team, core.GitHub("t", router), core.load_state(), limit=10)
+        self.assertEqual([i["number"] for i in items], [5], "only Ana is on the team")
+
+
 class Promotion(Home):
     def test_policies(self):
         state = core.load_state()

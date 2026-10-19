@@ -222,6 +222,9 @@ def review_items(team: dict, github: core.GitHub, state: dict, limit: int, probl
                 for pr in github.pages(f"/repos/{repo['repo']}/pulls?state=open&base={base}", limit=50):
                     if pr.get("draft") or pr["head"]["ref"] == repo["dev"]:
                         continue
+                    # Only the team's work: the owner's own PRs, bots and outside contributors are not reviewed here.
+                    if core.person_for(team, pr["user"]["login"]) is None:
+                        continue
                     record = state["reviews"].get(key(repo["repo"], pr["number"]), {})
                     if record.get("sha") == pr["head"]["sha"] and not record.get("retry"):
                         continue

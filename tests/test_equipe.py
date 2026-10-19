@@ -1,8 +1,10 @@
-"""The Team module against a fake GitHub and a fake board: merge rules, demand links, connections, the gate."""
+"""The Team module against a fake GitHub and a fake board: merge rules, promotions, demand links,
+connections, settings and the gate."""
 
 from __future__ import annotations
 
 import contextlib
+import datetime as dt
 import io
 import json
 import os
@@ -21,10 +23,12 @@ import equipe_gate  # noqa: E402
 
 REPO = "acme/app"
 SHA = "a" * 40
+BASE_SHA = "c" * 40
+SAO_PAULO = {"timezone": "America/Sao_Paulo", "quiet": {"start": "22:00", "end": "07:00"}}
 
 
 class FakeGitHub:
-    """Routes (method, url regex) to handlers; records every call."""
+    """Routes (method, url) to canned answers; records every call."""
 
     def __init__(self):
         self.calls = []
@@ -32,11 +36,15 @@ class FakeGitHub:
         self.statuses = {}
         self.files = [{"filename": "calc.py", "status": "modified", "additions": 3, "deletions": 0, "patch": "+x"}]
         self.workflows = 1
+        self.commit_date = "2000-01-01T00:00:00Z"
+        self.compare_commits = []
         self.pr = {"number": 7, "state": "open", "merged": False, "draft": False, "mergeable": True,
                    "html_url": f"https://github.com/{REPO}/pull/7", "title": "Subtração", "body": "Closes #3",
                    "user": {"login": "ana"},
                    "head": {"sha": SHA, "ref": "feat/sub", "repo": {"full_name": REPO}},
-                   "base": {"ref": "develop", "repo": {"full_name": REPO}}}
+                   "base": {"ref": "develop", "sha": BASE_SHA, "repo": {"full_name": REPO}}}
+        self.issue = {"number": 3, "html_url": f"https://github.com/{REPO}/issues/3", "title": "Subtração",
+                      "body": "- [ ] subtract\n- [ ] teste", "state": "open", "assignees": [{"login": "ana"}]}
         self.merge_answers = [(200, {"merged": True, "sha": "m" * 40}, {})]
         self.deleted = []
 
@@ -45,16 +53,22 @@ class FakeGitHub:
         path = re.sub(r"^https://api\.github\.com", "", url)
         if method == "GET" and re.match(rf"/repos/{REPO}/pulls/7$", path):
             return 200, self.pr, {}
-        if method == "GET" and re.match(rf"/repos/{REPO}/pulls/7/files", path):
-            return 200, self.files, {}
+        if method == "GET" and re.match(rf"/repos/{REPO}/pulls/7/commits", path):
+            return 200, [{"sha": "p" * 40, "commit": {"message": "Função subtract"}}], {}
+        if method == "GET" and path.startswith(f"/repos/{REPO}/compare/{BASE_SHA}...{SHA}"):
+            return 200, {"files": self.files}, {}
+        if method == "GET" and path.startswith(f"/repos/{REPO}/compare/main...develop"):
+            return 200, {"ahead_by": len(self.compare_commits), "commits": [{"sha": s} for s in self.compare_commits]}, {}
         if method == "GET" and "/check-runs" in path:
             sha = path.split("/commits/")[1].split("/")[0]
             state = self.checks.get(sha)
             runs = [{"name": "ci", "status": state[0], "conclusion": state[1]}] if state else []
-            return 200, {"check_runs": runs}, {}
+            return 200, {"total_count": len(runs), "check_runs": runs}, {}
         if method == "GET" and path.endswith("/status"):
             sha = path.split("/commits/")[1].split("/")[0]
             return 200, {"statuses": self.statuses.get(sha, [])}, {}
+        if method == "GET" and re.match(rf"/repos/{REPO}/commits/[0-9a-f]+$", path):
+            return 200, {"commit": {"committer": {"date": self.commit_date}}}, {}
         if method == "GET" and "/actions/workflows" in path:
             return 200, {"total_count": self.workflows}, {}
         if method == "PUT" and path.endswith("/merge"):
@@ -64,9 +78,8 @@ class FakeGitHub:
         if method == "DELETE" and "/git/refs/heads/" in path:
             self.deleted.append(path.split("/heads/")[1])
             return 204, None, {}
-        if method == "GET" and re.match(rf"/repos/{REPO}/issues/3$", path):
-            return 200, {"number": 3, "html_url": f"https://github.com/{REPO}/issues/3", "title": "Subtração",
-                         "body": "- [ ] subtract\n- [ ] teste", "state": "open", "assignees": [{"login": "ana"}]}, {}
+        if method == "GET" and re.match(rf"/repos/{REPO}/issues/\d+$", path):
+            return 200, self.issue, {}
         raise AssertionError(f"unexpected call {method} {url}")
 
 
@@ -76,10 +89,12 @@ class Home(unittest.TestCase):
         self.saved = {k: os.environ.get(k) for k in ("HERMES_HOME", "RITMO_NOW", "RITMO_GITHUB_APP_FILE")}
         os.environ["HERMES_HOME"] = self.home
         os.environ.pop("RITMO_NOW", None)
+        os.makedirs(os.path.join(self.home, "ritmo"))
+        with open(core.path("config.json"), "w") as handle:
+            json.dump(SAO_PAULO, handle)
         app = os.path.join(self.home, "github_app.json")
         with open(app, "w") as handle:
-            json.dump({"slug": "ritmo", "client_id": "Iv1.test"}, handle)
-        os.environ["RITMO_GITHUB_APP_FILE"] = app
+            json.dump({"slug": "ritmo-openseed", "client_id": "Iv1.test"}, handle)
         core.APP_FILE = app
         self.gh = FakeGitHub()
         self.team = core.validate_team({"enabled": True, "repos": [{"repo": REPO}],
@@ -97,10 +112,20 @@ class Home(unittest.TestCase):
     def blockers(self, sha=SHA, production=False, owner_ok=False, ritmo_config=None):
         github = core.GitHub("t", self.gh)
         return core.merge_blockers(github, self.team, self.repo, self.gh.pr, sha, production=production,
-                                   ritmo_config=ritmo_config or {}, owner_ok=owner_ok)
+                                   ritmo_config=SAO_PAULO if ritmo_config is None else ritmo_config, owner_ok=owner_ok)
+
+    def cli(self, *argv):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = equipe.main(list(argv))
+        return code, json.loads(buffer.getvalue())
 
 
 class MergeRules(Home):
+    def setUp(self):
+        super().setUp()
+        os.environ["RITMO_NOW"] = "2026-10-19T15:00:00+00:00"   # 12:00 in São Paulo: active hours
+
     def test_green_pr_on_the_reviewed_commit_may_merge(self):
         self.assertEqual(self.blockers(), [])
 
@@ -124,22 +149,21 @@ class MergeRules(Home):
         self.gh.statuses[SHA] = [{"context": "vercel", "state": "pending"}]
         self.assertIn("checks are still running", self.blockers())
 
-    def test_no_checks_yet_on_a_repo_with_ci_waits(self):
+    def test_no_checks_on_a_fresh_commit_waits_then_needs_the_owner(self):
         del self.gh.checks[SHA]
+        self.gh.commit_date = "2026-10-19T14:55:00Z"
         self.assertIn("no checks have started yet for this commit", self.blockers())
-
-    def test_repo_without_ci_needs_the_owner_unless_allowed(self):
-        del self.gh.checks[SHA]
-        self.gh.workflows = 0
-        self.assertTrue(any("no CI" in b for b in self.blockers()))
+        self.gh.commit_date = "2026-10-19T14:00:00Z"
+        self.assertTrue(any("no CI runs on this PR" in b for b in self.blockers()), "workflows that never run on PRs")
+        self.assertEqual(self.blockers(owner_ok=True), [])
         self.repo["allow_no_ci"] = True
         self.assertEqual(self.blockers(), [])
 
-    def test_changing_ci_workflows_needs_the_owner(self):
-        self.gh.files.append({"filename": ".github/workflows/ci.yml", "status": "modified", "additions": 1,
-                              "deletions": 1, "patch": ""})
-        self.assertTrue(any("workflows" in b for b in self.blockers()))
-        self.assertEqual(self.blockers(owner_ok=True), [])
+    def test_changing_ci_needs_the_owner(self):
+        for path in (".github/workflows/ci.yml", ".github/actions/setup/action.yml"):
+            self.gh.files = [{"filename": path, "status": "modified", "additions": 1, "deletions": 1, "patch": ""}]
+            self.assertTrue(any("changes CI" in b for b in self.blockers()), path)
+            self.assertEqual(self.blockers(owner_ok=True), [])
 
     def test_forks_drafts_conflicts_and_other_bases_block(self):
         self.gh.pr["head"]["repo"]["full_name"] = "stranger/app"
@@ -154,28 +178,36 @@ class MergeRules(Home):
         self.gh.pr["base"]["ref"] = "experiment"
         self.assertTrue(any("targets experiment" in b for b in self.blockers()))
 
-    def test_production_waits_for_the_owner_active_hours(self):
+    def test_production_waits_for_active_hours_and_fails_closed_without_a_timezone(self):
         os.environ["RITMO_NOW"] = "2026-10-19T02:00:00+00:00"   # 23:00 in São Paulo
-        config = {"timezone": "America/Sao_Paulo", "quiet": {"start": "22:00", "end": "07:00"}}
-        self.assertTrue(any("active hours" in b for b in self.blockers(production=True, ritmo_config=config)))
-        self.assertEqual(self.blockers(production=False, ritmo_config=config), [], "develop merges at any hour")
+        self.assertTrue(any("active hours" in b for b in self.blockers(production=True)))
+        self.assertEqual(self.blockers(production=False), [], "develop merges at any hour")
+        os.environ["RITMO_NOW"] = "2026-10-19T15:00:00+00:00"
+        self.assertTrue(any("timezone" in b for b in self.blockers(production=True, ritmo_config={})))
 
     def test_manual_production_needs_the_owner_ok(self):
         self.repo["promote"] = "manual"
         self.assertTrue(any("owner's ok" in b for b in self.blockers(production=True)))
         self.assertEqual(self.blockers(production=True, owner_ok=True), [])
 
-    def test_merge_pins_the_sha_and_falls_back_to_an_allowed_method(self):
-        self.gh.merge_answers = [(405, {"message": "Merge commits are not allowed"}, {}), (200, {"merged": True, "sha": "s"}, {})]
+    def test_merge_pins_the_sha_and_falls_back_only_when_the_method_is_forbidden(self):
+        self.gh.merge_answers = [(405, {"message": "Merge commits are not allowed on this repository"}, {}),
+                                 (200, {"merged": True, "sha": "s"}, {})]
         result = core.merge(core.GitHub("t", self.gh), self.team, self.repo, 7, SHA)
         self.assertEqual(result, {"merged": True, "method": "squash", "sha": "s"})
-        bodies = [body for method, _, body in self.gh.calls if method == "PUT"]
-        self.assertTrue(all(body["sha"] == SHA for body in bodies))
+        self.assertTrue(all(body["sha"] == SHA for method, _, body in self.gh.calls if method == "PUT"))
+        self.gh.merge_answers = [(405, {"message": "Required status check is expected"}, {})]
+        self.assertFalse(core.merge(core.GitHub("t", self.gh), self.team, self.repo, 7, SHA)["merged"])
+
+    def test_promotions_are_always_merge_commits(self):
+        self.gh.merge_answers = [(405, {"message": "Merge commits are not allowed"}, {})]
+        result = core.merge(core.GitHub("t", self.gh), self.team, self.repo, 7, SHA, promotion=True)
+        self.assertFalse(result["merged"])
+        self.assertEqual([b["merge_method"] for m, _, b in self.gh.calls if m == "PUT"], ["merge"])
 
     def test_a_moved_head_at_merge_time_is_not_merged(self):
         self.gh.merge_answers = [(409, {"message": "Head branch was modified"}, {})]
-        result = core.merge(core.GitHub("t", self.gh), self.team, self.repo, 7, SHA)
-        self.assertFalse(result["merged"])
+        self.assertFalse(core.merge(core.GitHub("t", self.gh), self.team, self.repo, 7, SHA)["merged"])
 
     def test_long_lived_branches_are_never_deleted(self):
         github = core.GitHub("t", self.gh)
@@ -185,24 +217,42 @@ class MergeRules(Home):
         self.assertTrue(core.delete_branch_if_safe(github, self.team, self.repo, self.gh.pr))
         self.assertEqual(self.gh.deleted, ["feat/sub"])
 
+    def test_a_successful_merge_makes_its_commits_promotable(self):
+        state = core.load_state()
+        result = equipe.try_merge(self.team, self.repo, core.GitHub("t", self.gh), state, 7, SHA)
+        self.assertTrue(result["merged"])
+        self.assertEqual(set(state["reviewed_commits"][REPO]), {"p" * 40, "m" * 40})
+
 
 class Promotion(Home):
     def test_policies(self):
-        config = {"timezone": "America/Sao_Paulo", "quiet": {"start": "22:00", "end": "07:00"}}
         state = core.load_state()
         os.environ["RITMO_NOW"] = "2026-10-19T15:00:00+00:00"   # 12:00 in São Paulo
-        self.assertTrue(core.promotion_due(self.repo, config, state))
+        self.assertTrue(core.promotion_due(self.repo, SAO_PAULO, state))
+        self.assertFalse(core.promotion_due(self.repo, {}, state), "never without the owner's timezone")
         self.repo["promote"] = "manual"
-        self.assertFalse(core.promotion_due(self.repo, config, state))
+        self.assertFalse(core.promotion_due(self.repo, SAO_PAULO, state))
         self.repo["promote"] = "18:00"
-        self.assertFalse(core.promotion_due(self.repo, config, state))
+        self.assertFalse(core.promotion_due(self.repo, SAO_PAULO, state))
         os.environ["RITMO_NOW"] = "2026-10-19T21:30:00+00:00"   # 18:30
-        self.assertTrue(core.promotion_due(self.repo, config, state))
+        self.assertTrue(core.promotion_due(self.repo, SAO_PAULO, state))
         state["promotions"][REPO] = "2026-10-19"
-        self.assertFalse(core.promotion_due(self.repo, config, state), "once a day")
+        self.assertFalse(core.promotion_due(self.repo, SAO_PAULO, state), "once a day")
         self.repo["promote"] = "now"
         os.environ["RITMO_NOW"] = "2026-10-19T03:00:00+00:00"   # 00:00, quiet
-        self.assertFalse(core.promotion_due(self.repo, config, state))
+        self.assertFalse(core.promotion_due(self.repo, SAO_PAULO, state))
+
+    def test_commits_pushed_straight_to_develop_are_not_promoted(self):
+        state = core.load_state()
+        core.remember_reviewed(state, REPO, ["r1" * 20])
+        self.gh.compare_commits = ["r1" * 20, "x9" * 20]
+        result = equipe.promote(self.team, self.repo, core.GitHub("t", self.gh), state)
+        self.assertFalse(result["promoted"])
+        self.assertIn("did not pass a Ritmo review", result["blockers"][0])
+
+    def test_single_branch_repos_have_nothing_to_promote(self):
+        team = core.validate_team({"repos": [{"repo": REPO, "dev": "main", "prod": "main"}]})
+        self.assertFalse(core.promotion_due(team["repos"][0], SAO_PAULO, core.load_state()))
 
 
 class DemandLinks(Home):
@@ -213,6 +263,7 @@ class DemandLinks(Home):
         self.assertEqual(core.demand_refs(self.team, self.pr(body="Closes #12, refs #3")), ["12", "3"])
         self.assertEqual(core.demand_refs(self.team, self.pr(body=f"see https://github.com/{REPO}/issues/9")), ["9"])
         self.assertEqual(core.demand_refs(self.team, self.pr(body="see https://github.com/other/repo/issues/9")), [])
+        self.assertEqual(core.demand_refs(self.team, self.pr(body="prefix #3 and suffix")), [], "'fix' inside a word")
 
     def test_board_references(self):
         team = core.validate_team({"board": {"type": "ritmo", "url": "https://painel.example.com"}})
@@ -220,8 +271,19 @@ class DemandLinks(Home):
         self.assertEqual(core.demand_refs(team, self.pr(body=body)), ["24"])
         self.assertEqual(core.demand_refs(team, self.pr(title="Demanda #31: login")), ["31"])
         self.assertEqual(core.demand_refs(team, self.pr(branch="feat/demanda-42-tela")), ["42"])
-        self.assertEqual(core.demand_refs(team, self.pr(body="https://evil.example/tarefas?t=5")), [],
-                         "a link to another system is not this board's demand")
+        self.assertEqual(core.demand_refs(team, self.pr(body="https://evil.example/tarefas?t=5 https://painel.example.com")),
+                         [], "a link to another system is not this board's demand")
+
+    def test_a_pr_or_a_closed_issue_is_never_the_demand(self):
+        board = core.GithubIssuesBoard(core.GitHub("t", self.gh), REPO)
+        self.assertEqual(board.get("3")["title"], "Subtração")
+        self.gh.issue["pull_request"] = {"url": "x"}
+        with self.assertRaises(core.EquipeError):
+            board.get("3")
+        del self.gh.issue["pull_request"]
+        self.gh.issue["state"] = "closed"
+        with self.assertRaises(core.EquipeError):
+            board.get("3")
 
 
 class Connections(Home):
@@ -242,10 +304,11 @@ class Connections(Home):
 
         started = core.github_connect_start(fake)
         self.assertEqual(started["code"], "ABCD-1234")
-        self.assertIn("/apps/ritmo/installations/new", started["install_url"])
+        self.assertIn("/apps/ritmo-openseed/installations/new", started["install_url"])
         self.assertEqual(core.github_connect_poll(fake)["status"], "pending")
         self.assertEqual(core.github_connect_poll(fake)["status"], "connected")
-        self.assertEqual(oct(os.stat(core.path("github.json")).st_mode & 0o777), oct(0o600)) if os.name != "nt" else None
+        if os.name != "nt":
+            self.assertEqual(os.stat(core.path("github.json")).st_mode & 0o777, 0o600)
         os.environ["RITMO_NOW"] = "2099-01-01T00:00:00+00:00"
         saved = core.read_json("github.json", {})
         saved["expires_at"] = "2098-12-31T23:55:00+00:00"
@@ -276,59 +339,143 @@ class Settings(Home):
                            ({"repos": [{"repo": REPO, "promote": "sometimes"}]}, "promote"),
                            ({"people": [{"name": "Ana", "github": "bad login!"}]}, "GitHub login"),
                            ({"publish": "maybe"}, "publish"),
+                           ({"merge_method": "rebase"}, "merge or squash"),
+                           ({"paused_until": "2026-10-20T08:00:00"}, "offset"),
                            ({"surprise": 1}, "unknown team key")]:
             with self.assertRaises(core.EquipeError) as caught:
                 core.validate_team(bad)
             self.assertIn(words, str(caught.exception))
 
-    def cli(self, *argv):
-        buffer = io.StringIO()
-        with contextlib.redirect_stdout(buffer):
-            code = equipe.main(list(argv))
-        return code, json.loads(buffer.getvalue())
+    def test_cannot_turn_on_before_ritmo_knows_the_owner_timezone(self):
+        os.remove(core.path("config.json"))
+        with self.assertRaises(core.EquipeError) as caught:
+            core.validate_team({"enabled": True})
+        self.assertIn("timezone", str(caught.exception))
 
-    def test_cli_builds_the_team_step_by_step(self):
-        self.cli("team", "repo", "add", REPO, "--promote", "18:00")
+    def test_cli_builds_the_team_and_edits_only_what_was_said(self):
+        self.cli("team", "repo", "add", REPO, "--dev", "dev", "--prod", "master", "--allow-no-ci")
+        self.cli("team", "repo", "add", REPO, "--promote", "manual")
         self.cli("team", "person", "add", "Ana", "Lima", "--github", "ana", "--level", "junior",
                  "--board-person", "ana@acme.com")
+        self.cli("team", "person", "add", "Ana", "Lima", "--github", "ana")
         code, shown = self.cli("team", "show")
         self.assertEqual(code, 0, shown)
-        self.assertEqual(shown["team"]["repos"][0]["promote"], "18:00")
-        self.assertEqual(shown["team"]["people"][0]["name"], "Ana Lima")
+        repo = shown["team"]["repos"][0]
+        self.assertEqual((repo["dev"], repo["prod"], repo["promote"], repo["allow_no_ci"]), ("dev", "master", "manual", True))
+        person = shown["team"]["people"][0]
+        self.assertEqual((person["name"], person["level"], person["board_person"]), ("Ana Lima", "junior", "ana@acme.com"))
         self.assertIn("github connect", shown["setup_missing"])
-        code, result = self.cli("team", "repo", "remove", "acme/other")
+        code, _ = self.cli("team", "repo", "remove", "acme/other")
         self.assertEqual(code, 1)
+
+    def test_single_branch_repo_is_accepted(self):
+        code, result = self.cli("team", "repo", "add", REPO, "--dev", "main", "--prod", "main")
+        self.assertEqual(code, 0, result)
+
+    def test_verdict_refuses_a_short_or_stale_sha(self):
+        core.save_team(self.team)
+        core.write_json("github.json", {"access_token": "t"}, private=True)
+        original = core.http
+        try:
+            core.GitHub.__init__.__defaults__ = (self.gh,)
+            code, result = self.cli("verdict", REPO, "7", "--sha", "aaaaaaa", "--ok")
+            self.assertEqual(code, 1)
+            self.assertIn("40-character", result["error"])
+            code, result = self.cli("verdict", REPO, "7", "--sha", "b" * 40, "--ok")
+            self.assertEqual(code, 1)
+            self.assertIn("not the PR's current commit", result["error"])
+        finally:
+            core.GitHub.__init__.__defaults__ = (original,)
+
+    def test_owner_ok_is_refused_right_after_an_automatic_handout(self):
+        core.save_team(self.team)
+        core.write_json("github.json", {"access_token": "t"}, private=True)
+        os.environ["RITMO_NOW"] = "2026-10-19T15:00:00+00:00"
+        state = core.load_state()
+        state["last_handout"] = "2026-10-19T14:55:00+00:00"
+        core.write_json("equipe_state.json", state)
+        code, result = self.cli("merge", REPO, "7", "--sha", SHA, "--owner-ok")
+        self.assertEqual(code, 1)
+        self.assertIn("automatic review is running", result["error"])
 
 
 class Gate(Home):
+    def setUp(self):
+        super().setUp()
+        os.environ["RITMO_NOW"] = "2026-10-19T15:00:00+00:00"
+
+    def connect(self):
+        core.save_team(self.team)
+        core.write_json("github.json", {"access_token": "t"}, private=True)
+
+    @contextlib.contextmanager
+    def patched(self, **functions):
+        saved = {name: getattr(equipe, name) for name in functions}
+        for name, fn in functions.items():
+            setattr(equipe, name, fn)
+        try:
+            yield
+        finally:
+            for name, fn in saved.items():
+                setattr(equipe, name, fn)
+
     def test_silent_until_enabled_and_connected(self):
         self.assertEqual(equipe_gate.gate(), equipe_gate.SILENT)
         core.save_team(self.team)
         self.assertEqual(equipe_gate.gate(), equipe_gate.SILENT, "no GitHub connection yet")
 
-    def test_hands_out_a_review_once_then_retries_after_30_minutes(self):
-        core.save_team(self.team)
-        core.write_json("github.json", {"access_token": "t"}, private=True)
-        work = [{"type": "review", "repo": REPO, "number": 7, "sha": SHA, "author": "ana", "base": "develop"}]
-        calls = {"n": 0}
+    def test_a_review_is_handed_out_once_retried_once_then_reported(self):
+        self.connect()
+        work = {"type": "review", "repo": REPO, "number": 7, "sha": SHA, "author": "ana", "base": "develop"}
 
-        def fake_pending(team, github, state, limit=3):
-            calls["n"] += 1
-            return [w for w in work if state["reviews"].get(equipe.key(REPO, 7), {}).get("sha") != SHA]
+        def items(team, github, state, limit, problems=None):
+            record = state["reviews"].get(equipe.key(REPO, 7), {})
+            return [] if record.get("sha") == SHA and not record.get("retry") else [dict(work)]
 
-        original = equipe.pending_work
-        equipe.pending_work = fake_pending
-        try:
-            os.environ["RITMO_NOW"] = "2026-10-19T15:00:00+00:00"
-            first = json.loads(equipe_gate.gate())
-            self.assertEqual(first["equipe"][0]["number"], 7)
+        with self.patched(review_items=items, promote=lambda *a, **k: {"promoted": False, "nothing_new": True}):
+            self.assertEqual(json.loads(equipe_gate.gate())["equipe"][0]["number"], 7)
             self.assertEqual(equipe_gate.gate(), equipe_gate.SILENT, "in review: not handed out again right away")
             os.environ["RITMO_NOW"] = "2026-10-19T15:31:00+00:00"
-            self.assertIn("equipe", json.loads(equipe_gate.gate()), "retried once after 30 minutes")
+            self.assertEqual(len(json.loads(equipe_gate.gate())["equipe"]), 1, "retried once after 30 minutes")
             os.environ["RITMO_NOW"] = "2026-10-19T16:05:00+00:00"
-            self.assertEqual(equipe_gate.gate(), equipe_gate.SILENT, "then left for the owner")
-        finally:
-            equipe.pending_work = original
+            notices = json.loads(equipe_gate.gate())["notices"]
+            self.assertEqual(notices[0]["type"], "review_failed", "then the owner is told")
+            os.environ["RITMO_NOW"] = "2026-10-19T16:40:00+00:00"
+            self.assertEqual(equipe_gate.gate(), equipe_gate.SILENT, "once")
+
+    def test_waiting_merges_happen_in_code_and_the_same_blocker_is_told_once(self):
+        self.connect()
+        state = core.load_state()
+        state["reviews"][equipe.key(REPO, 7)] = {"sha": SHA, "verdict": "ok_waiting", "blockers": []}
+        core.write_json("equipe_state.json", state)
+        answers = [{"merged": False, "blockers": ["checks failed: ci"]}, {"merged": False, "blockers": ["checks failed: ci"]},
+                   {"merged": True, "into": "develop"}]
+        with self.patched(review_items=lambda *a, **k: [], try_merge=lambda *a, **k: answers.pop(0),
+                          promote=lambda *a, **k: {"promoted": False, "nothing_new": True}):
+            first = json.loads(equipe_gate.gate())["notices"]
+            self.assertEqual(first[0]["type"], "waiting")
+            self.assertEqual(equipe_gate.gate(), equipe_gate.SILENT, "same blocker: no new message, no LLM")
+            merged = json.loads(equipe_gate.gate())["notices"]
+            self.assertEqual(merged[0], {"type": "merged", "repo": REPO, "number": 7, "into": "develop"})
+
+    def test_a_broken_repository_is_reported_once_and_does_not_stop_the_others(self):
+        self.connect()
+
+        def items(team, github, state, limit, problems=None):
+            problems[REPO] = "GitHub GET /repos/acme/app/pulls answered 404: Not Found"
+            return []
+
+        with self.patched(review_items=items, promote=lambda *a, **k: {"promoted": False, "nothing_new": True}):
+            notices = json.loads(equipe_gate.gate())["notices"]
+            self.assertEqual(notices[0]["type"], "problem")
+            self.assertEqual(equipe_gate.gate(), equipe_gate.SILENT)
+
+    def test_paused(self):
+        self.connect()
+        team = core.load_team()
+        team["paused_until"] = "2026-10-20T08:00:00-03:00"
+        core.save_team(team)
+        self.assertEqual(equipe_gate.gate(), equipe_gate.SILENT)
 
 
 if __name__ == "__main__":

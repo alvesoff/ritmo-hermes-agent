@@ -123,17 +123,22 @@ def gate() -> str:
             core.write_json("equipe_state.json", state)
             return json.dumps({"equipe": [], "notices": notes}, separators=(",", ":")) if notes else SILENT
         now = core.now_utc()
-        for review_key, record in state["reviews"].items():
+        for review_key, record in list(state["reviews"].items()):
             if record.get("verdict") != "in_review" or now - dt.datetime.fromisoformat(record["at"]) <= RETRY_AFTER:
                 continue
-            if record.get("attempts", 0) < MAX_ATTEMPTS:
-                record["retry"] = True
+            if record.get("retry"):
+                # Flagged for a retry and still not handed out (its author left the team, say): start clean.
+                del state["reviews"][review_key]
+            elif record.get("attempts", 0) < MAX_ATTEMPTS:
+                record.update(retry=True, at=now.isoformat(timespec="seconds"))
             else:
                 record["verdict"] = "stuck"
                 notes.append({"type": "review_failed", "pr": review_key})
         waiting_merges(team, github, state, notes)
         due_promotions(team, github, state, notes, problems)
-        items = equipe.review_items(team, github, state, limit=3, problems=problems)
+        found = equipe.review_items(team, github, state, limit=3, problems=problems)
+        notes += [{k: v for k, v in item.items()} for item in found if item["type"] == "outside"]
+        items = [item for item in found if item["type"] == "review"]
         for item in items:
             review_key = equipe.key(item["repo"], item["number"])
             previous = state["reviews"].get(review_key, {})

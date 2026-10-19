@@ -622,6 +622,10 @@ def merge_blockers(github: GitHub, team: dict, repo: dict, pr: dict, reviewed_sh
         # Nothing else is worth checking for a commit that is no longer the PR's head.
         return ["new commits arrived after the review; it will be reviewed again"]
     blockers = []
+    promotion = pr["head"]["ref"] == repo["dev"] and pr["base"]["ref"] == repo["prod"] and repo["dev"] != repo["prod"]
+    author = (pr.get("user") or {}).get("login", "")
+    if not promotion and person_for(team, author) is None and not owner_ok:
+        blockers.append(f"{author or 'the author'} is not on the team; merging their PR needs the owner")
     if pr.get("state") != "open" or pr.get("merged"):
         blockers.append(f"PR {number} is not open")
     if pr.get("draft"):
@@ -697,11 +701,23 @@ def remember_reviewed(state: dict, repo: str, shas: list[str]) -> None:
     del known[:-5000]
 
 
-def unreviewed_commits(github: GitHub, state: dict, repo: dict) -> list[str]:
-    """Commits on dev that would reach production without having passed a Ritmo review."""
+def unreviewed_commits(github: GitHub, state: dict, repo: dict, team: dict) -> list[str]:
+    """Team commits on dev that would reach production without having passed a Ritmo review.
+
+    The rule is about the team going around the review: commits the owner merged by hand
+    (theirs, a bot's) are the owner's call and pass. A commit GitHub cannot tie to any
+    account is treated as the team's: unknown is never trusted.
+    """
     compare = github.call("GET", f"/repos/{repo['repo']}/compare/{repo['prod']}...{repo['dev']}")
     known = set(state["reviewed_commits"].get(repo["repo"].lower(), []))
-    return [c["sha"] for c in compare.get("commits", []) if c["sha"] not in known]
+    unreviewed = []
+    for commit in compare.get("commits", []):
+        if commit["sha"] in known:
+            continue
+        logins = [(commit.get(role) or {}).get("login") for role in ("author", "committer")]
+        if not any(logins) or any(login and person_for(team, login) for login in logins):
+            unreviewed.append(commit["sha"])
+    return unreviewed
 
 
 def promotion_due(repo: dict, config: dict, state: dict) -> bool:

@@ -19,16 +19,17 @@ for name in $(cat /opt/ritmo/skills.list 2>/dev/null); do
   source="$BUNDLED/$name"
   target="$HOME_SKILLS/$name"
   [ -d "$source" ] || continue
-  if [ -d "$target" ] && diff -rq "$source" "$target" >/dev/null 2>&1; then
-    continue
+  if ! { [ -d "$target" ] && diff -rq "$source" "$target" >/dev/null 2>&1; }; then
+    echo "[ritmo] restoring skill $name from the image"
+    rm -rf "$target"
+    cp -a "$source" "$target"
+    if [ -f "$MANIFEST" ]; then
+      grep -v "^$name:" "$MANIFEST" > "$MANIFEST.new" 2>/dev/null || true
+      mv "$MANIFEST.new" "$MANIFEST"
+      chown hermes:hermes "$MANIFEST"
+    fi
   fi
-  echo "[ritmo] restoring skill $name from the image"
-  rm -rf "$target"
-  cp -a "$source" "$target"
-  chown -R hermes:hermes "$target"
-  if [ -f "$MANIFEST" ]; then
-    grep -v "^$name:" "$MANIFEST" > "$MANIFEST.new" 2>/dev/null || true
-    mv "$MANIFEST.new" "$MANIFEST"
-    chown hermes:hermes "$MANIFEST"
-  fi
+  # Root-owned and read-only: the agent reads its skills but can never patch them.
+  chown -R root:root "$target"
+  chmod -R a-w "$target"
 done

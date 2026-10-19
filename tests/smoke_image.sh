@@ -111,4 +111,13 @@ restored=$($AS_AGENT HERMES_SESSION_ID=s-smoke HERMES_SESSION_CHAT_ID=cht_smoke 
   || fail "import --from-chat failed against Hermes' real state.db: $restored"
 echo "$restored" | grep -q '"timezone": "America/Sao_Paulo"' || fail "import --from-chat restored something else: $restored"
 
+echo "== the home copy of the skills is read-only for the agent"
+mkdir -p /var/lib/hermes/skills && chown hermes:hermes /var/lib/hermes/skills
+/etc/cont-init.d/40-ritmo-skills
+[ -f /var/lib/hermes/skills/ritmo/scripts/ritmo.py ] || fail "40-ritmo-skills did not copy the skill"
+! /command/s6-setuidgid hermes sh -c 'echo x >> /var/lib/hermes/skills/ritmo/scripts/ritmo.py' 2>/dev/null \
+  || fail "the agent can still patch its own ritmo.py"
+/command/s6-setuidgid hermes cat /var/lib/hermes/skills/ritmo/SKILL.md >/dev/null || fail "the agent cannot read its skill"
+/etc/cont-init.d/40-ritmo-skills  # a second boot leaves it alone and still read-only
+
 echo "SMOKE OK"

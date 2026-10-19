@@ -10,7 +10,7 @@ PY=/opt/hermes/.venv/bin/python3
 AS_AGENT="/command/s6-setuidgid hermes env HOME=/tmp/rh HERMES_HOME=/tmp/rh"
 
 echo "== files"
-for f in /opt/hermes/plow-seed/persona.md /opt/ritmo/ritmo_boot.py /opt/ritmo/skills.list \
+for f in /opt/hermes/plow-seed/persona.md /opt/ritmo/ritmo_boot.py /opt/ritmo/skills.list /opt/ritmo/github_app.json \
          /opt/hermes/skills/ritmo/SKILL.md /opt/hermes/skills/ritmo/scripts/ritmo.py \
          /etc/s6-overlay/scripts/ritmo-boot.sh /etc/cont-init.d/40-ritmo-skills \
          /etc/s6-overlay/s6-rc.d/ritmo-boot/up /etc/s6-overlay/s6-rc.d/hermes-gateway/dependencies.d/ritmo-boot; do
